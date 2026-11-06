@@ -31,7 +31,13 @@ function runBuildFeed() {
   tell_('Feed built', [`✓ ${run.rows_out} videos in the feed`, `Run ID: ${run.run_id}`]);
 }
 
-function buildFeed_(cfg) {
+/** One-off trigger set by a score run that was short on time. */
+function continueBuildFeed() {
+  deleteTriggersFor_('continueBuildFeed');
+  runBuildFeed();
+}
+
+function buildFeed_(cfg, deadlineMs) {
   const ss = getSpreadsheet_();
   cfg = cfg || readSettings_(ss);
   const started = new Date();
@@ -45,7 +51,7 @@ function buildFeed_(cfg) {
       run.rows_out = bqQueryToTable_(cfg, buildFeedSql_(t('raw_videos'), t('scored_videos')), {
         topic: cfg.TOPIC, prompt_version: promptVersion_(cfg), min_score: cfg.MIN_SCORE, max_duration: SHORTS_MAX_SEC,
         min_published: minPublished_(cfg), language: cfg.LANGUAGE_FILTER,
-      }, 'feed');
+      }, 'feed', deadlineMs);
     } else {
       const rows = buildFeedRows_(cfg, sheetsReadTable_(ss, 'raw_videos'), sheetsReadTable_(ss, 'scored_videos'), started);
       run.rows_out = sheetsReplaceRows_(ss, 'feed', rows);

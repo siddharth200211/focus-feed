@@ -117,6 +117,15 @@ function bqInspect_(cfg) {
  * never load the same batch twice. Waits for the job and returns the rows loaded.
  */
 function bqLoadRows_(cfg, tableName, rows, runId) {
+  const ref = bqStartLoad_(cfg, tableName, rows, runId);
+  const res = bqWaitJob_(cfg, ref, Date.now() + 2 * 60 * 1000);
+  if (!res.done) throw new Error(`BigQuery load job ${ref.jobId} is still running after 2 minutes.`);
+  if (res.error) throw new Error(`Loading ${tableName} failed: ${res.error}`);
+  return res.outputRows || rows.length;
+}
+
+/** Submits a batch load job and returns at once with its reference (the load runs on BigQuery's side). */
+function bqStartLoad_(cfg, tableName, rows, runId) {
   const projectId = cfg.BQ_PROJECT_ID;
   const job = {
     jobReference: { projectId, jobId: `focusfeed_${tableName}_${runId}` },
@@ -130,19 +139,24 @@ function bqLoadRows_(cfg, tableName, rows, runId) {
     },
   };
   const data = Utilities.newBlob(rows.map(r => JSON.stringify(r)).join('\n'), 'application/octet-stream');
-  let res = BigQuery.Jobs.insert(job, projectId, data);
-  const ref = res.jobReference;
-  const deadline = Date.now() + 2 * 60 * 1000;
+  const res = BigQuery.Jobs.insert(job, projectId, data);
+  return { jobId: res.jobReference.jobId, location: res.jobReference.location, rows: rows.length, table: tableName, first: res };
+}
+
+/** Polls a job until it finishes or the deadline passes. Returns { done, error, outputRows }. */
+function bqWaitJob_(cfg, ref, deadline) {
+  let res = ref.first || BigQuery.Jobs.get(cfg.BQ_PROJECT_ID, ref.jobId, { location: ref.location });
+  ref.first = null;
   while (res.status.state !== 'DONE') {
-    if (Date.now() > deadline) throw new Error(`BigQuery load job ${ref.jobId} is still running after 2 minutes.`);
+    if (Date.now() + 1500 > deadline) return { done: false };
     Utilities.sleep(1500);
-    res = BigQuery.Jobs.get(projectId, ref.jobId, { location: ref.location });
+    res = BigQuery.Jobs.get(cfg.BQ_PROJECT_ID, ref.jobId, { location: ref.location });
   }
   if (res.status.errorResult) {
     const details = (res.status.errors || []).slice(0, 3).map(e => e.message).join(' | ');
-    throw new Error(`Loading ${tableName} failed: ${res.status.errorResult.message}${details ? ' — ' + details : ''}`);
+    return { done: true, error: res.status.errorResult.message + (details ? ' — ' + details : '') };
   }
-  return Number(res.statistics && res.statistics.load && res.statistics.load.outputRows) || rows.length;
+  return { done: true, outputRows: Number(res.statistics && res.statistics.load && res.statistics.load.outputRows) || ref.rows };
 }
 
 /**
@@ -209,7 +223,7 @@ function bqParams_(params) {
  * Replaces a table's contents with a query result (a query job with WRITE_TRUNCATE).
  * Not DML, so it works in the sandbox. Returns the table's new row count.
  */
-function bqQueryToTable_(cfg, sql, params, tableName) {
+function bqQueryToTable_(cfg, sql, params, tableName, deadlineMs) {
   const projectId = cfg.BQ_PROJECT_ID;
   const query = {
     query: sql,
@@ -223,9 +237,9 @@ function bqQueryToTable_(cfg, sql, params, tableName) {
   if (TABLES[tableName].clusterFields) query.clustering = { fields: TABLES[tableName].clusterFields };
   let res = BigQuery.Jobs.insert({ configuration: { query } }, projectId);
   const ref = res.jobReference;
-  const deadline = Date.now() + 2 * 60 * 1000;
+  const deadline = Math.min(Date.now() + 2 * 60 * 1000, deadlineMs || Infinity);
   while (res.status.state !== 'DONE') {
-    if (Date.now() > deadline) throw new Error(`BigQuery job ${ref.jobId} is still running after 2 minutes.`);
+    if (Date.now() > deadline) throw new Error(`BigQuery job ${ref.jobId} is still running (it will finish on its own).`);
     Utilities.sleep(1000);
     res = BigQuery.Jobs.get(projectId, ref.jobId, { location: ref.location });
   }

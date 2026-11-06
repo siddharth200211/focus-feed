@@ -17,6 +17,9 @@ const SCORE_CANDIDATE_LIMIT = 2000;
 const SCORE_START_BATCHES_MS = 3 * 60 * 1000;
 const SCORE_RETRY_UNTIL_MS = 4 * 60 * 1000;
 const SCORE_SAVE_EVERY_ROWS = 50;
+const SCORE_SAVES_SETTLE_MS = 4.75 * 60 * 1000;  // stop waiting for BigQuery saves after this
+const SCORE_FEED_INLINE_MS = 3.5 * 60 * 1000;    // later than this, the feed rebuild runs as its own job
+const SCORE_SAFETY_NET_MS = 8 * 60 * 1000;       // if Apps Script kills a run, this trigger picks up
 const SCORE_SCHEMA = {
   type: 'ARRAY',
   items: {
@@ -102,11 +105,17 @@ function score_() {
   let unsaved = [];
   let saves = 0;
   // Saves in small chunks, so a run cut off by Apps Script loses at most one chunk.
+  const pendingSaves = [];
+  // Saves in small chunks without waiting for BigQuery, so a run cut off by Apps Script loses
+  // at most one chunk, and saving never eats into scoring time.
   const save = () => {
     if (!unsaved.length) return;
-    run.rows_out += storeAppend_(cfg, 'scored_videos', unsaved, `${run.run_id}_${++saves}`);
+    run.rows_out += storeAppend_(cfg, 'scored_videos', unsaved, `${run.run_id}_${++saves}`, { wait: false, jobs: pendingSaves });
     unsaved = [];
   };
+  // Safety net: if Apps Script stops this run at its 6-minute limit, scoring resumes by itself.
+  deleteTriggersFor_('continueScore');
+  ScriptApp.newTrigger('continueScore').timeBased().after(SCORE_SAFETY_NET_MS).create();
   const keep = rows => {
     stats.rows = stats.rows.concat(rows);
     unsaved = unsaved.concat(rows);
@@ -182,11 +191,21 @@ function score_() {
   } catch (e) {
     failure = e;
   }
-  // Save the rest, even if the run failed part-way.
+  // Save the rest, even if the run failed part-way, then check that every save landed.
   try {
     save();
   } catch (e) {
     failure = failure || e;
+  }
+  if (pendingSaves.length) {
+    let failedRows = 0, stillRunning = 0;
+    pendingSaves.forEach(ref => {
+      const res = bqWaitJob_(cfg, ref, started.getTime() + SCORE_SAVES_SETTLE_MS);
+      if (!res.done) stillRunning += ref.rows;
+      else if (res.error) { failedRows += ref.rows; stats.notes.push(`a save failed (${res.error}); those videos are re-scored next run`); }
+    });
+    run.rows_out -= failedRows;
+    if (stillRunning) stats.notes.push(`${stillRunning} scores are still being saved by BigQuery`);
   }
   run.status = failure ? 'error' : 'ok';
   stats.avgSec = stats.calls ? Math.round(stats.callMs / stats.calls / 1000) : 0;
@@ -196,6 +215,7 @@ function score_() {
   run.finished_at = new Date().toISOString();
   logRun_(cfg, run);
   if (failure) {
+    deleteTriggersFor_('continueScore'); // the run ended on its own: no safety net needed
     failure.notes = stats.notes.filter(x => !/^avg /.test(x));
     throw failure;
   }
@@ -203,10 +223,17 @@ function score_() {
   stats.left = Math.max(0, stats.total - stats.rows.length);
   scheduleScoreContinuation_(stats);
   if (stats.rows.length) {
-    try {
-      stats.feedSize = buildFeed_(cfg).rows_out; // step 3 right after new scores
-    } catch (e) {
-      stats.notes.push('feed rebuild failed: ' + e.message);
+    if (Date.now() - started.getTime() > SCORE_FEED_INLINE_MS) {
+      // Not enough time left in this run: rebuild the feed as its own job in a minute.
+      deleteTriggersFor_('continueBuildFeed');
+      ScriptApp.newTrigger('continueBuildFeed').timeBased().after(60 * 1000).create();
+      stats.feedLater = true;
+    } else {
+      try {
+        stats.feedSize = buildFeed_(cfg, started.getTime() + 5.5 * 60 * 1000).rows_out; // step 3 right after new scores
+      } catch (e) {
+        stats.notes.push('feed rebuild failed: ' + e.message);
+      }
     }
   }
   return Object.assign(stats, { run, storage: cfg.STORAGE, minScore: cfg.MIN_SCORE });
@@ -359,6 +386,7 @@ function scoreSummary_(r) {
     `✓ ${n(r.run.rows_out)} rows written to ${where}`,
   ];
   if (r.feedSize !== undefined) lines.push(`✓ Feed rebuilt: ${n(r.feedSize)} videos ready to watch`);
+  if (r.feedLater) lines.push('✓ Feed rebuild starts in about a minute');
   const sorted = scored.slice().sort((a, b) => b.score - a.score);
   const show = x => `"${String(r.titles[x.video_id] || x.video_id).slice(0, 70)}" — ${x.score}: ${x.reason}`;
   if (sorted.length) lines.push('', 'Top: ' + show(sorted[0]));

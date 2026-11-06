@@ -122,10 +122,11 @@ function fakeBigQuery({ sandbox = true, projects = ['my-project'] } = {}) {
         assert.ok(table, `load target ${key} exists`);
         const rows = blob.getDataAsString().split('\n').map(l => JSON.parse(l));
         rows.forEach(r => validateRow(table, r));
-        const result = store.loadError
+        const failing = store.loadError && (!store.loadErrorFor || store.loadErrorFor === load.destinationTable.tableId);
+        const result = failing
           ? { state: 'DONE', errorResult: { message: store.loadError }, errors: [{ message: 'row 1: bad value' }] }
           : { state: 'DONE' };
-        if (!store.loadError) (store.rows[load.destinationTable.tableId] = store.rows[load.destinationTable.tableId] || []).push(...rows);
+        if (!failing) (store.rows[load.destinationTable.tableId] = store.rows[load.destinationTable.tableId] || []).push(...rows);
         store.jobs[id] = { jobReference: { projectId: p, jobId: id, location: 'US' }, status: result, statistics: { load: { outputRows: String(rows.length) } } };
         return { jobReference: { projectId: p, jobId: id, location: 'US' }, status: { state: 'RUNNING' } };
       },
@@ -1547,4 +1548,66 @@ test('rules: checkSetup lists the content rules', () => {
   const env = rulesEnv({ settings: { LANGUAGE_FILTER: 'en', MAX_VIDEO_AGE_DAYS: 730, SCORING_GUIDANCE: 'New format only.' } });
   env.run('checkSetup()');
   assert.match(env.lastAlert().msg, /Content rules: English only · no ads · published in the last 730 days · your own guidance \(scoring version v1-[0-9a-z]+\)/);
+});
+
+/* ---------- staying inside Apps Script's 6-minute limit ---------- */
+
+test('limit: a safety-net continuation exists while scoring and is removed when the run ends normally', () => {
+  const env = scoreEnv();
+  const seen = [];
+  const inner = env.gem.fetch;
+  env.gem.fetch = (url, opts) => {
+    if (/:generateContent$/.test(url)) seen.push(env.triggers.filter(t => t.fn === 'continueScore').map(t => t.after));
+    return inner(url, opts);
+  };
+  env.run('runScore()');
+  assert.deepEqual(seen[0], [8 * 60 * 1000], 'safety net armed before the first Gemini call');
+  assert.equal(env.triggers.filter(t => t.fn === 'continueScore').length, 0, 'removed: nothing left to score');
+
+  const bad = scoreEnv({ gemini: { on: { 1: 'badkey' } } });
+  bad.run('runScore()');
+  assert.equal(bad.triggers.filter(t => t.fn === 'continueScore').length, 0, 'a real failure does not loop every 8 minutes');
+});
+
+test('limit: saves do not wait for BigQuery between batches; they are checked once at the end', () => {
+  const env = scoreEnv();
+  const getsAtCall = [];
+  const inner = env.gem.fetch;
+  env.gem.fetch = (url, opts) => {
+    if (/:generateContent$/.test(url)) getsAtCall.push(env.bq.calls.filter(c => c === 'Jobs.get').length);
+    return inner(url, opts);
+  };
+  env.run('runScore()');
+  assert.ok(getsAtCall.length > 10);
+  assert.equal(getsAtCall[getsAtCall.length - 1], getsAtCall[0], 'no polling while scoring');
+  assert.equal(env.bq.rows.scored_videos.length, feedEligible(env.bq.rows.raw_videos).length);
+});
+
+test('limit: a save that fails in the background is reported, and those videos are scored again next run', () => {
+  const env = scoreEnv();
+  env.bq.loadError = 'Quota exceeded';
+  env.bq.loadErrorFor = 'scored_videos';
+  env.run('runScore()');
+  assert.equal(env.lastAlert().title, 'Score finished');
+  assert.match(env.lastAlert().msg, /a save failed \(Quota exceeded/);
+  assert.match(env.lastAlert().msg, /✓ 0 rows written to BigQuery scored_videos/);
+  env.bq.loadError = null;
+  const calls = env.gem.calls.length;
+  env.run('runScore()');
+  assert.ok(env.gem.calls.length > calls, 'scored again');
+  assert.equal(env.bq.rows.scored_videos.length, feedEligible(env.bq.rows.raw_videos).length);
+});
+
+test('limit: a run that is late hands the feed rebuild to its own job a minute later', () => {
+  const env = scoreEnv({ gemini: { clock: 75 * 1000 } });
+  env.run('globalThis.__now = Date.now(); Date.now = () => globalThis.__now;');
+  env.run('runScore()');
+  assert.match(env.lastAlert().msg, /Feed rebuild starts in about a minute/);
+  const t = env.triggers.filter(x => x.fn === 'continueBuildFeed');
+  assert.equal(t.length, 1);
+  assert.equal(t[0].after, 60000);
+  assert.equal(env.bq.rows.feed, undefined, 'not rebuilt inside the late run');
+  env.run('continueBuildFeed()');
+  assert.ok(env.bq.rows.feed.length > 0);
+  assert.equal(env.triggers.filter(x => x.fn === 'continueBuildFeed').length, 0, 'the one-off trigger removes itself');
 });

@@ -17,8 +17,14 @@ function newRunId_(now) {
  * BigQuery: one batch load job (sandbox-safe). Sheets: append to the tab, then prune.
  * Returns the number of rows written.
  */
-function storeAppend_(cfg, tableName, rows, runId) {
+function storeAppend_(cfg, tableName, rows, runId, opts) {
   if (!rows.length) return 0;
+  if (cfg.STORAGE === 'bigquery' && opts && opts.wait === false) {
+    // Fire-and-forget: submit the load and carry on; the caller can check opts.jobs later.
+    const ref = bqStartLoad_(cfg, tableName, rows, runId);
+    if (opts.jobs) opts.jobs.push(ref);
+    return rows.length;
+  }
   if (cfg.STORAGE === 'bigquery') return bqLoadRows_(cfg, tableName, rows, runId);
   return sheetsAppendRows_(getSpreadsheet_(), tableName, rows, cfg.LITE_MAX_ROWS);
 }
@@ -26,7 +32,7 @@ function storeAppend_(cfg, tableName, rows, runId) {
 /** Writes one pipeline_runs row. Never throws: a logging failure must not hide the real result. */
 function logRun_(cfg, run) {
   try {
-    storeAppend_(cfg, 'pipeline_runs', [run], `${run.run_id}_${run.step}`);
+    storeAppend_(cfg, 'pipeline_runs', [run], `${run.run_id}_${run.step}`, { wait: false }); // don't spend run time waiting
   } catch (e) {
     console.error(`Could not log run ${run.run_id}: ${e.message}`);
   }
