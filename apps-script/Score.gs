@@ -182,6 +182,13 @@ function score_() {
 
   stats.left = Math.max(0, stats.total - stats.rows.length);
   scheduleScoreContinuation_(stats);
+  if (stats.rows.length) {
+    try {
+      stats.feedSize = buildFeed_(cfg).rows_out; // step 3 right after new scores
+    } catch (e) {
+      stats.notes.push('feed rebuild failed: ' + e.message);
+    }
+  }
   return Object.assign(stats, { run, storage: cfg.STORAGE, minScore: cfg.MIN_SCORE });
 }
 
@@ -328,6 +335,7 @@ function scoreSummary_(r) {
     `Spread: 0–3: ${n(band(0, 3))} · 4–6: ${n(band(4, 6))} · 7–8: ${n(band(7, 8))} · 9–10: ${n(band(9, 10))}`,
     `✓ ${n(r.run.rows_out)} rows written to ${where}`,
   ];
+  if (r.feedSize !== undefined) lines.push(`✓ Feed rebuilt: ${n(r.feedSize)} videos ready to watch`);
   const sorted = scored.slice().sort((a, b) => b.score - a.score);
   const show = x => `"${String(r.titles[x.video_id] || x.video_id).slice(0, 70)}" — ${x.score}: ${x.reason}`;
   if (sorted.length) lines.push('', 'Top: ' + show(sorted[0]));

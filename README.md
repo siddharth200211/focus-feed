@@ -4,7 +4,7 @@ A swipe feed of YouTube Shorts about **one topic you choose**, so scrolling beco
 
 Under the hood it's a small data pipeline. A daily job collects Shorts from the YouTube Data API, Gemini scores each one for relevance, and the results go through `raw → scored → feed` tables. A mobile web app serves the feed and logs what you watch or skip, and that feeds back into the pipeline. It runs entirely on free tiers, and anyone can run their own copy.
 
-> **Status: Phase 1, in progress.** Done so far: Settings tab, Setup menu (spreadsheet tabs or BigQuery tables), tests, GitHub → Apps Script deploys, step 1 (daily collect) and step 2 (Gemini scoring). Next up: feed build and the web app.
+> **Status: Phase 1, in progress.** Done so far: Settings tab, Setup menu (spreadsheet tabs or BigQuery tables), tests, GitHub → Apps Script deploys, step 1 (daily collect), step 2 (Gemini scoring), step 3 (feed build) and step 4 (the swipe web app, v1). Next up: the nightly events load into BigQuery and using watch/skip signals.
 
 ## How it works
 
@@ -54,6 +54,15 @@ Both modes use one schema ([`Schema.gs`](apps-script/Schema.gs)), so switching m
 8. **Score.** Setup also schedules scoring an hour after collect. Run **FocusFeed → Run score now** to score straight away; the summary shows the score spread plus the best and worst video so you can judge the model's taste.
 
 > Keep the sheet, the script, the BigQuery project and the Gemini key on **one Google account**. Check setup shows which account the script runs as.
+
+## Deploy the web app
+
+1. In the Apps Script editor: **Deploy → New deployment → Select type: Web app**.
+2. *Execute as:* **Me** · *Who has access:* **Anyone** → **Deploy**, and approve the permissions.
+3. Open the **/exec** link (or **FocusFeed → Open feed**) on your phone. No login is needed; the page reads the feed through your script.
+4. Optional: copy the **Deployment ID** into the GitHub variable `DEPLOYMENT_ID`, so every push to `main` updates the web app too.
+
+The page shows the best-scored videos first, one per screen, with Gemini's score and reason. Swipe up for the next one. What you watch (3 s or more) or skip is logged to the `events` tab, and those videos are hidden for 14 days.
 
 ## Settings
 
@@ -122,7 +131,9 @@ apps-script/
   Collect.gs        step 1: rotating searches → video details → raw_videos
   Gemini.gs         Gemini client: JSON-schema output, retries, rate-limit handling
   Score.gs          step 2: unscored candidates → Gemini in batches → scored_videos
-  Setup.gs          FocusFeed menu: Setup, Gemini key, Run collect/score now, Check setup, sandbox reminder
+  Feed.gs           step 3: latest score ≥ MIN_SCORE → feed; step 4: doGet, getFeedPage, logEvents
+  Index.html        the swipe page: scroll-snap cards, YouTube IFrame API player, event logging
+  Setup.gs          FocusFeed menu: Setup, Gemini key, Run collect/score now, Build feed now, Open feed, Check setup, sandbox reminder
 tests/gas.test.js   runs the real .gs files against in-memory fakes of Google services
 ```
 

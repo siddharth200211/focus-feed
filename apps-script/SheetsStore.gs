@@ -81,3 +81,25 @@ function sheetsReadTable_(ss, tableName) {
     return o;
   });
 }
+
+/** Replaces every data row of a tab (header kept). Returns the number of rows written. */
+function sheetsReplaceRows_(ss, tableName, rows) {
+  const sh = ss.getSheetByName(tableName);
+  if (!sh) throw new Error(`No "${tableName}" tab. Run FocusFeed → Setup.`);
+  if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).clearContent();
+  return rows.length ? sheetsAppendRows_(ss, tableName, rows, null) : 0;
+}
+
+/**
+ * Appends rows one appendRow call each. Each call is atomic, so concurrent web app requests
+ * can't overwrite each other without needing a lock (the script lock is held by long runs).
+ */
+function sheetsAppendRowsAtomic_(ss, tableName, rows, maxRows) {
+  const sh = ss.getSheetByName(tableName);
+  if (!sh) throw new Error(`No "${tableName}" tab. Run FocusFeed → Setup.`);
+  const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h).trim());
+  rows.forEach(r => sh.appendRow(header.map(h => (r[h] === undefined || r[h] === null ? '' : r[h]))));
+  const extra = sh.getLastRow() - 1 - (maxRows || Infinity);
+  if (extra > 500) sh.deleteRows(2, extra); // prune in chunks, not on every call
+  return rows.length;
+}

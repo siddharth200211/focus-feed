@@ -24,6 +24,7 @@ class Range {
   }
   setValue(x) { this.sh.set(this.r, this.c, x); return this; }
   getValues() { return Array.from({ length: this.nr }, (_, i) => Array.from({ length: this.nc }, (_, j) => this.sh.get(this.r + i, this.c + j))); }
+  clearContent() { for (let i = 0; i < this.nr; i++) for (let j = 0; j < this.nc; j++) this.sh.set(this.r + i, this.c + j, ''); return this; }
   setDataValidation(v) { this.sh.validation[`${this.r},${this.c}`] = v; return this; }
   setFontWeight() { return this; } setNumberFormat() { return this; } setBackground() { return this; }
   setWrap() { return this; } setFontColor() { return this; }
@@ -39,6 +40,7 @@ class Sheet {
   getRange(r, c, nr = 1, nc = 1) { if (c + nc - 1 > this.maxCols) throw new Error('range beyond max columns'); return new Range(this, r, c, nr, nc); }
   getMaxColumns() { return this.maxCols; }
   getMaxRows() { return this.maxRows; }
+  appendRow(values) { const r = this.getLastRow() + 1; if (r > this.maxRows) this.maxRows = r; values.forEach((v, j) => this.set(r, j + 1, v)); return this; }
   insertRowsAfter(after, n) { this.maxRows += n; }
   deleteRows(start, n) {
     const moved = {};
@@ -86,7 +88,7 @@ function fakeBigQuery({ sandbox = true, projects = ['my-project'] } = {}) {
       },
     },
     Tables: {
-      get(p, d, t) { store.calls.push('Tables.get'); checkProject(p); const tb = store.tables[`${p}.${d}.${t}`]; if (!tb) throw notFound(`Table ${p}:${d}.${t}`); return JSON.parse(JSON.stringify(tb)); },
+      get(p, d, t) { store.calls.push('Tables.get'); checkProject(p); const tb = store.tables[`${p}.${d}.${t}`]; if (!tb) throw notFound(`Table ${p}:${d}.${t}`); return Object.assign(JSON.parse(JSON.stringify(tb)), { numRows: String((store.rows[t] || []).length) }); },
       insert(res, p, d) {
         store.calls.push('Tables.insert');
         const ds = store.datasets[`${p}.${d}`]; assert.ok(ds, 'dataset must exist before tables');
@@ -107,6 +109,7 @@ function fakeBigQuery({ sandbox = true, projects = ['my-project'] } = {}) {
     Jobs: {
       insert(job, p, blob) {
         store.calls.push('Jobs.insert');
+        if (job.configuration.query) return fakeQueryJob(store, job, p);
         const id = job.jobReference.jobId;
         assert.match(id, /^[A-Za-z0-9_-]{1,1024}$/, 'valid job ID');
         if (store.jobs[id]) throw new Error(`Already Exists: Job ${p}:US.${id}`);
@@ -136,10 +139,10 @@ function fakeBigQuery({ sandbox = true, projects = ['my-project'] } = {}) {
       query(req, p) {
         store.calls.push('Jobs.query');
         assert.equal(req.useLegacySql, false);
-        assert.match(req.query, /^-- focusfeed: score candidates\nSELECT /, 'read-only SELECT');
         assert.doesNotMatch(req.query, /\b(INSERT|UPDATE|DELETE|MERGE)\b/i, 'no DML in the sandbox');
-        const prm = {};
-        req.queryParameters.forEach(q => { prm[q.name] = q.parameterType.type === 'INT64' ? Number(q.parameterValue.value) : q.parameterValue.value; });
+        const prm = readParams(req.queryParameters);
+        if (/^-- focusfeed: feed page\n/.test(req.query)) return fakeFeedPage(store, p, prm);
+        assert.match(req.query, /^-- focusfeed: score candidates\nSELECT /, 'read-only SELECT');
         assert.deepEqual(Object.keys(prm).sort(), ['max_duration', 'max_rows', 'prompt_version', 'topic']);
         const done = new Set((store.rows.scored_videos || []).filter(s => s.topic === prm.topic && s.prompt_version === prm.prompt_version).map(s => s.video_id));
         const latest = {};
@@ -170,6 +173,51 @@ function fakeBigQuery({ sandbox = true, projects = ['my-project'] } = {}) {
   return store;
 }
 
+function readParams(list) {
+  const prm = {};
+  list.forEach(q => {
+    prm[q.name] = q.parameterType.type === 'ARRAY' ? q.parameterValue.arrayValues.map(x => x.value)
+      : q.parameterType.type === 'INT64' ? Number(q.parameterValue.value) : q.parameterValue.value;
+  });
+  return prm;
+}
+
+/** The feed rebuild (query job → WRITE_TRUNCATE into feed), computed in JS. Its SQL is checked separately. */
+function fakeQueryJob(store, job, p) {
+  const q = job.configuration.query;
+  assert.match(q.query, /^-- focusfeed: build feed\n/);
+  assert.doesNotMatch(q.query, /\b(INSERT|UPDATE|DELETE|MERGE)\b/i, 'no DML in the sandbox');
+  assert.equal(q.writeDisposition, 'WRITE_TRUNCATE');
+  assert.equal(q.destinationTable.tableId, 'feed');
+  assert.deepEqual(JSON.parse(JSON.stringify(q.clustering)), { fields: ['topic'] }, 'keeps the table clustering');
+  const prm = readParams(q.queryParameters);
+  const scores = {}, raws = {}, first = {};
+  (store.rows.scored_videos || []).filter(s => s.topic === prm.topic && s.prompt_version === prm.prompt_version && s.score !== null)
+    .forEach(s => { if (!scores[s.video_id] || s.scored_at > scores[s.video_id].scored_at) scores[s.video_id] = s; });
+  (store.rows.raw_videos || []).filter(r => r.topic === prm.topic).forEach(r => {
+    if (!raws[r.video_id] || r.collected_at > raws[r.video_id].collected_at) raws[r.video_id] = r;
+    if (!first[r.video_id] || r.collected_at < first[r.video_id]) first[r.video_id] = r.collected_at;
+  });
+  store.rows.feed = Object.keys(scores).filter(id => raws[id] && scores[id].score >= prm.min_score && raws[id].embeddable &&
+    raws[id].duration_sec >= 1 && raws[id].duration_sec <= prm.max_duration).map(id => ({
+    video_id: id, topic: prm.topic, title: raws[id].title, channel_title: raws[id].channel_title, duration_sec: raws[id].duration_sec,
+    published_at: raws[id].published_at, score: scores[id].score, reason: scores[id].reason, first_seen_at: first[id], built_at: new Date().toISOString(),
+  }));
+  const id = 'feedjob' + store.calls.length;
+  store.jobs[id] = { jobReference: { projectId: p, jobId: id, location: 'US' }, status: { state: 'DONE' } };
+  return { jobReference: { projectId: p, jobId: id, location: 'US' }, status: { state: 'RUNNING' } };
+}
+
+function fakeFeedPage(store, p, prm) {
+  assert.ok(Array.isArray(prm.exclude) && prm.exclude.length >= 1, 'exclude is a non-empty ARRAY<STRING>');
+  const skip = new Set(prm.exclude);
+  const rows = (store.rows.feed || []).filter(v => v.topic === prm.topic && !skip.has(v.video_id))
+    .sort((a, b) => b.score - a.score || (a.video_id + prm.seed < b.video_id + prm.seed ? -1 : 1)).slice(0, prm.limit);
+  const fields = [['video_id', 'STRING'], ['title', 'STRING'], ['channel_title', 'STRING'], ['duration_sec', 'INTEGER'], ['score', 'INTEGER'], ['reason', 'STRING']];
+  return { jobComplete: true, jobReference: { projectId: p, jobId: 'page', location: 'US' }, schema: { fields: fields.map(([name, type]) => ({ name, type })) },
+    rows: rows.length ? rows.map(r => ({ f: fields.map(([n]) => ({ v: r[n] === null ? null : String(r[n]) })) })) : undefined };
+}
+
 /** What a BigQuery JSON load would reject. */
 function validateRow(table, row) {
   const fields = {};
@@ -190,6 +238,9 @@ function validateRow(table, row) {
  * some videos come back from several searches. Every 13th video has vanished by the
  * details lookup; every 5th is longer than 3 minutes; every 11th isn't embeddable.
  */
+/** Real YouTube IDs are 11 characters: v + 10 digits. */
+const vid = k => 'v' + String(k).padStart(10, '0');
+
 function fakeYouTube({ quotaOn = 0, failOn = [] } = {}) {
   const yt = { searches: [], detailCalls: [] };
   yt.api = {
@@ -200,7 +251,7 @@ function fakeYouTube({ quotaOn = 0, failOn = [] } = {}) {
         if (n === quotaOn) throw new Error('The request cannot be completed because you have exceeded your quota.');
         if (failOn.includes(n)) throw new Error('Backend Error');
         return { items: Array.from({ length: 50 }, (_, i) => {
-          const id = `v${(n * 37 + i) % 1200}`;
+          const id = vid((n * 37 + i) % 1200);
           return { id: { kind: 'youtube#video', videoId: id }, snippet: {
             publishedAt: '2026-10-01T10:00:00Z', channelId: 'UC1', channelTitle: 'Prep &amp; Co',
             title: `Don&#39;t miss this ${id}`, description: 'desc', thumbnails: { high: { url: `https://i.ytimg.com/${id}.jpg` } } } };
@@ -232,11 +283,13 @@ function formatUtc(d, f) {
 
 function load({ bq = fakeBigQuery(), yt = fakeYouTube(), prompts = [], fetch } = {}) {
   const book = fakeBook();
-  const props = {}, triggers = [], mails = [], alerts = [], fetches = [], logs = [], sleeps = [];
+  const props = {}, triggers = [], mails = [], alerts = [], fetches = [], logs = [], sleeps = [], dialogs = [];
+  const webAppUrl = { value: null };
   const ui = {
     Button: { OK: 'OK', CANCEL: 'CANCEL' }, ButtonSet: { OK: 'OK', OK_CANCEL: 'OK_CANCEL' },
     createMenu() { const m = { items: [], addItem: (l, f) => (m.items.push(f), m), addSeparator: () => m, addToUi: () => { ui.menu = m.items; } }; return m; },
     alert: (title, msg) => { alerts.push({ title, msg: msg || '' }); },
+    showModalDialog: (out, title) => { dialogs.push({ out, title }); },
     prompt: () => { const next = prompts.shift(); return { getSelectedButton: () => (next === null ? 'CANCEL' : 'OK'), getResponseText: () => next || '' }; },
   };
   const validation = () => { const b = { requireValueInList: () => b, requireNumberBetween: () => b, setAllowInvalid: () => b, setHelpText: () => b, build: () => ({}) }; return b; };
@@ -246,13 +299,18 @@ function load({ bq = fakeBigQuery(), yt = fakeYouTube(), prompts = [], fetch } =
     PropertiesService: { getScriptProperties: () => ({ getProperty: k => (k in props ? props[k] : null), getProperties: () => Object.assign({}, props), setProperty: (k, v) => { props[k] = String(v); }, deleteProperty: k => { delete props[k]; } }) },
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock() { } }) },
     Session: { getEffectiveUser: () => ({ getEmail: () => 'me@example.com' }), getScriptTimeZone: () => 'Asia/Kolkata' },
-    Utilities: { formatDate: (d, tz, f) => formatUtc(d, f), newBlob: (text) => ({ text, getDataAsString: () => text }), sleep: ms => sleeps.push(ms) },
+    Utilities: { formatDate: (d, tz, f) => formatUtc(d, f), newBlob: (text) => ({ text, getDataAsString: () => text }), sleep: ms => sleeps.push(ms), getUuid: () => require('crypto').randomUUID() },
     Logger: { log: m => logs.push(m) },
     MailApp: { sendEmail: (to, subject, body) => mails.push({ to, subject, body }) },
     ScriptApp: {
+      getService: () => ({ getUrl: () => webAppUrl.value }),
       getProjectTriggers: () => triggers.slice(),
       deleteTrigger: t => triggers.splice(triggers.indexOf(t), 1),
       newTrigger: fn => { const t = { fn, getHandlerFunction: () => fn }; const b = { timeBased: () => b, at: d => (t.at = d, b), everyDays: n => (t.everyDays = n, b), atHour: h => (t.atHour = h, b), after: ms => (t.after = ms, b), create: () => (triggers.push(t), t) }; return b; },
+    },
+    HtmlService: {
+      createHtmlOutputFromFile: name => { const o = { name, meta: {}, setTitle: t => (o.title = t, o), addMetaTag: (k, v) => (o.meta[k] = v, o), getContent: () => fs.readFileSync(path.join(DIR, name + '.html'), 'utf8') }; return o; },
+      createHtmlOutput: html => { const o = { html, setWidth: () => o, setHeight: () => o }; return o; },
     },
     UrlFetchApp: { fetch: (url, opts) => { fetches.push({ url, opts }); return (fetch || (() => ({ code: 200, body: '{}' })))(url, opts); } },
     YouTube: Object.assign({ I18nLanguages: { list: () => ({ items: [] }) } }, yt.api),
@@ -267,7 +325,7 @@ function load({ bq = fakeBigQuery(), yt = fakeYouTube(), prompts = [], fetch } =
   const setting = key => { const sh = book.getSheetByName('Settings'); const row = sh.rows().find(r => r[0] === key); return row ? row[1] : undefined; };
   const setSetting = (key, v) => run(`writeSetting_(getSpreadsheet_(), ${JSON.stringify(key)}, ${JSON.stringify(v)})`);
   const reminders = () => triggers.filter(t => t.fn === 'sendExpiryReminder');
-  return { g, run, book, bq, yt, props, triggers, sleeps, reminders, mails, alerts, fetches, logs, ui, setting, setSetting, lastAlert: () => alerts[alerts.length - 1] };
+  return { g, run, book, bq, yt, props, triggers, sleeps, dialogs, webAppUrl, reminders, mails, alerts, fetches, logs, ui, setting, setSetting, lastAlert: () => alerts[alerts.length - 1] };
 }
 
 /* ---------- tests ---------- */
@@ -306,7 +364,7 @@ test('manifest: advanced services, scopes and an anonymous web app', () => {
 test('onOpen adds the FocusFeed menu', () => {
   const env = load();
   env.run('onOpen()');
-  assert.deepEqual(env.ui.menu, ['setup', 'setGeminiApiKey', 'runCollect', 'runScore', 'checkSetup']);
+  assert.deepEqual(env.ui.menu, ['setup', 'setGeminiApiKey', 'runCollect', 'runScore', 'runBuildFeed', 'openFeed', 'checkSetup']);
 });
 
 test('first Setup (sheets): asks for the topic, builds Settings + data tabs, removes empty Sheet1', () => {
@@ -595,8 +653,8 @@ test('collect (bigquery): 50 searches, unique rows batch-loaded into raw_videos,
   assert.equal(env.yt.searches.length, 50);
   assert.ok(rows.length > 500, `got ${rows.length} rows`);
   assert.equal(new Set(rows.map(r => r.video_id)).size, rows.length, 'one row per video per run');
-  const r = rows.find(x => x.video_id === 'v38');
-  assert.equal(r.title, "Don't miss this v38");
+  const r = rows.find(x => x.video_id === vid(38));
+  assert.equal(r.title, `Don't miss this ${vid(38)}`);
   assert.equal(r.channel_title, 'Prep & Co');
   assert.equal(r.duration_sec, 45);
   assert.equal(r.view_count, 380);
@@ -792,7 +850,7 @@ test('score (bigquery): every feed-eligible video scored once, in batches of 25,
     assert.match(c.body.systemInstruction.parts[0].text, /learning "TOEFL"/);
     c.items.forEach(i => assert.ok(i.description.length <= 300 && i.title.length <= 200));
   });
-  const v38 = scored.find(s => s.video_id === 'v38');
+  const v38 = scored.find(s => s.video_id === vid(38));
   assert.deepEqual([v38.score, v38.model, v38.prompt_version, v38.topic], [38 % 11, 'gemini-test-flash-001', 'v1', 'TOEFL']);
   const log = env.bq.rows.pipeline_runs.filter(r => r.step === 'score');
   assert.equal(log.length, 1);
@@ -819,7 +877,7 @@ test('score: skipped or invalid answers are stored as unscored and not retried',
   assert.equal(nulls.length, 2 + 25, 'a skipped id, an out-of-range score, and a whole unusable batch');
   assert.ok(scored.every(s => s.score === null || (s.score >= 0 && s.score <= 10)), 'out-of-range 99 ignored');
   const third = env.gem.calls[1].items[2];
-  const v3 = scored.find(s => s.video_id === `v${third.title.match(/v(\d+)/)[1]}`);
+  const v3 = scored.find(s => s.video_id === vid(Number(third.title.match(/v(\d+)/)[1])));
   assert.equal(v3.reason, `about ${third.title.slice(-4)}`, 'first answer for a duplicated id wins');
   assert.ok(nulls.some(s => /model skipped/.test(s.reason)));
   assert.ok(nulls.some(s => /no usable score: Gemini returned malformed JSON/.test(s.reason)));
@@ -1107,4 +1165,135 @@ test('a failed run still shows what happened with each model', () => {
   assert.equal(env.lastAlert().title, 'Score failed');
   assert.match(env.lastAlert().msg, /API key not valid/);
   assert.match(env.lastAlert().msg, /⚠ gemini-flash-latest overloaded .*; switched to gemini-flash-lite-latest/);
+});
+
+/* ---------- Feed (step 3) and web app (step 4) ---------- */
+
+function expectedFeed(env) {
+  const eligible = new Map(feedEligible(env.bq.rows.raw_videos).map(r => [r.video_id, r]));
+  return env.bq.rows.scored_videos.filter(s => s.score !== null && s.score >= 7 && eligible.has(s.video_id));
+}
+
+test('feed (bigquery): every score run rebuilds the feed with videos scoring 7 or more', () => {
+  const env = scoreEnv();
+  env.run('runScore()');
+  const feed = env.bq.rows.feed;
+  const want = expectedFeed(env);
+  assert.equal(feed.length, want.length);
+  assert.ok(feed.length > 0 && feed.every(v => v.score >= 7));
+  assert.match(env.lastAlert().msg, new RegExp(`Feed rebuilt: ${feed.length.toLocaleString('en-US')} videos ready to watch`));
+  const log = env.bq.rows.pipeline_runs.find(r => r.step === 'build_feed');
+  assert.deepEqual([log.status, log.rows_out], ['ok', feed.length]);
+});
+
+test('feed: Build feed now works on its own, and uses the newest score per video', () => {
+  const env = scoreEnv();
+  env.run('runScore()');
+  const v = env.bq.rows.feed[0].video_id;
+  env.bq.rows.scored_videos.push({ run_id: 'later', scored_at: '2099-01-01T00:00:00.000Z', topic: 'TOEFL', video_id: v, score: 2, reason: 'rescored low', model: 'm', prompt_version: 'v1' });
+  env.run('runBuildFeed()');
+  assert.ok(!env.bq.rows.feed.some(x => x.video_id === v), 'a newer low score drops it');
+  assert.match(env.lastAlert().msg, /✓ \d+ videos in the feed/);
+});
+
+test('feed (sheets): the feed tab is rewritten, not appended to', () => {
+  const env = scoreEnv({ storage: 'sheets' });
+  env.run('runScore()');
+  const first = env.run('sheetsReadTable_(getSpreadsheet_(), "feed")');
+  assert.ok(first.length > 0 && first.every(v => v.score >= 7 && v.topic === 'TOEFL'));
+  env.run('runBuildFeed()');
+  const again = env.run('sheetsReadTable_(getSpreadsheet_(), "feed")');
+  assert.equal(again.length, first.length, 'rebuilt in place');
+});
+
+test('web app: doGet serves Index.html with a title and phone viewport', () => {
+  const env = load();
+  const out = env.g.doGet({ parameter: {} });
+  assert.equal(out.name, 'Index');
+  assert.equal(out.title, 'FocusFeed');
+  assert.match(out.meta.viewport, /width=device-width/);
+  const html = out.getContent();
+  assert.match(html, /google\.script\.run/);
+  assert.match(html, /getFeedPage/);
+  assert.match(html, /logEvents/);
+  assert.match(html, /youtube\.com\/iframe_api/);
+});
+
+function feedEnv(storage = 'bigquery') {
+  const env = scoreEnv({ storage });
+  env.run('runScore()');
+  env.alerts.length = 0;
+  return env;
+}
+
+test('getFeedPage (bigquery): 50 at a time, best first, skipping what this session loaded', () => {
+  const env = feedEnv();
+  const p1 = env.run('getFeedPage({ seed: "abc" })');
+  assert.equal(p1.topic, 'TOEFL');
+  assert.equal(p1.videos.length, Math.min(50, env.bq.rows.feed.length));
+  assert.equal(p1.more, env.bq.rows.feed.length > 50);
+  const scores = p1.videos.map(v => v.score);
+  assert.deepEqual(scores, scores.slice().sort((a, b) => b - a), 'best first');
+  assert.deepEqual(Object.keys(p1.videos[0]).sort(), ['channel', 'id', 'reason', 'score', 'seconds', 'title']);
+  const p2 = env.run(`getFeedPage({ seed: "abc", exclude: ${JSON.stringify(p1.videos.map(v => v.id))} })`);
+  assert.ok(p2.videos.every(v => !p1.videos.some(x => x.id === v.id)), 'no repeats in a session');
+});
+
+test('logEvents: valid events land in the events tab; junk is dropped', () => {
+  const env = feedEnv();
+  const now = new Date().toISOString();
+  const n = env.run(`logEvents([
+    { video_id: 'abcdefghijk', event_type: 'watch', watch_ms: 12345.6, position: 0, session_id: 'sess123456', at: '${now}' },
+    { video_id: 'abcdefghijl', event_type: 'skip', watch_ms: -5, position: 1, session_id: 'sess123456', at: '1999-01-01T00:00:00Z' },
+    { video_id: 'bad id', event_type: 'watch' },
+    { video_id: 'abcdefghijm', event_type: 'delete_everything' },
+    null,
+  ])`);
+  assert.equal(n, 2);
+  const rows = env.run('sheetsReadTable_(getSpreadsheet_(), "events")');
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map(r => [r.video_id, r.event_type, r.watch_ms, r.topic]), [['abcdefghijk', 'watch', 12346, 'TOEFL'], ['abcdefghijl', 'skip', 0, 'TOEFL']]);
+  assert.ok(Date.now() - Date.parse(rows[1].event_at) < 60000, 'implausible client time replaced by server time');
+  assert.ok(rows.every(r => /^[0-9a-f-]{36}$/.test(r.event_id)));
+  assert.equal(env.run('logEvents("nope")'), 0);
+});
+
+test('getFeedPage hides videos watched or skipped recently, unless includeSeen', () => {
+  const env = feedEnv();
+  const all = env.run('getFeedPage({ seed: "s" })').videos;
+  const seen = all.slice(0, 3).map((v, i) => ({ video_id: v.id, event_type: i ? 'skip' : 'watch', watch_ms: 5000, position: i, session_id: 'sess123456', at: new Date().toISOString() }));
+  env.run(`logEvents(${JSON.stringify(seen)})`);
+  const after = env.run('getFeedPage({ seed: "s" })').videos.map(v => v.id);
+  assert.ok(seen.every(e => !after.includes(e.video_id)));
+  const again = env.run('getFeedPage({ seed: "s", includeSeen: true })').videos.map(v => v.id);
+  assert.ok(seen.every(e => again.includes(e.video_id)));
+});
+
+test('getFeedPage (sheets) reads the feed tab', () => {
+  const env = feedEnv('sheets');
+  const page = env.run('getFeedPage({ seed: "z" })');
+  assert.ok(page.videos.length > 0 && page.videos.every(v => v.score >= 7));
+  const scores = page.videos.map(v => v.score);
+  assert.deepEqual(scores, scores.slice().sort((a, b) => b - a));
+});
+
+test('Open feed: deploy instructions before the first deployment, a link after', () => {
+  const env = load({ prompts: ['TOEFL'] });
+  env.run('setup()');
+  env.run('openFeed()');
+  assert.match(env.lastAlert().title, /Deploy the web app first/);
+  env.webAppUrl.value = 'https://script.google.com/macros/s/ABC/exec';
+  env.run('openFeed()');
+  assert.equal(env.dialogs.length, 1);
+  assert.match(env.dialogs[0].out.html, /href="https:\/\/script\.google\.com\/macros\/s\/ABC\/exec"/);
+});
+
+test('checkSetup reports the last feed build and whether the web app is deployed', () => {
+  const env = feedEnv();
+  env.run('checkSetup()');
+  assert.match(env.lastAlert().msg, /✓ Last feed build: .* UTC, ok, \d+ videos/);
+  assert.match(env.lastAlert().msg, /✗ Web app not deployed yet/);
+  env.webAppUrl.value = 'https://script.google.com/macros/s/ABC/exec';
+  env.run('checkSetup()');
+  assert.match(env.lastAlert().msg, /✓ Web app deployed/);
 });

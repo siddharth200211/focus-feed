@@ -6,6 +6,8 @@
  *   FocusFeed → Set Gemini API key…    stores the key in Script Properties (never in the sheet)
  *   FocusFeed → Run collect now        pipeline step 1 on demand (it also runs daily)
  *   FocusFeed → Run score now          pipeline step 2 on demand (daily, an hour after collect)
+ *   FocusFeed → Build feed now         pipeline step 3 on demand (also runs after every score run)
+ *   FocusFeed → Open feed              link to the web app (step 4)
  *   FocusFeed → Check setup            read-only health check: account, settings, APIs, tables
  */
 const REMIND_DAYS_BEFORE_EXPIRY = 15; // sandbox tables live 60 days → reminder on day 45
@@ -19,7 +21,9 @@ function onOpen() {
     .addSeparator()
     .addItem('Run collect now', 'runCollect')
     .addItem('Run score now', 'runScore')
+    .addItem('Build feed now', 'runBuildFeed')
     .addSeparator()
+    .addItem('Open feed', 'openFeed')
     .addItem('Check setup', 'checkSetup')
     .addToUi();
   try { warnIfSandboxExpiring_(); } catch (e) { /* never block the menu */ }
@@ -189,6 +193,14 @@ function checkSetup() {
         `${last.status}, ${last.rows} rows${last.message ? ' — ' + last.message : ''}`);
     }
   });
+  const lastFeed = lastRun_('build_feed');
+  if (lastFeed) {
+    out.push(`${lastFeed.status === 'ok' ? '✓' : '✗'} Last feed build: ${String(lastFeed.at).slice(0, 16).replace('T', ' ')} UTC, ` +
+      `${lastFeed.status}, ${lastFeed.rows} videos${lastFeed.message ? ' — ' + lastFeed.message : ''}`);
+  }
+  let appUrl = null;
+  try { appUrl = ScriptApp.getService().getUrl(); } catch (e) { /* not deployed */ }
+  out.push(appUrl ? '✓ Web app deployed (FocusFeed → Open feed)' : '✗ Web app not deployed yet (Deploy → New deployment → Web app)');
   out.push(`YouTube units used today: ${ytUnitsUsedToday_()} of ${YT_DAILY_QUOTA}`);
 
   try {

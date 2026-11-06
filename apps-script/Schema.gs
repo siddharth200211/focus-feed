@@ -72,7 +72,7 @@ const TABLES = {
       ['event_at', 'TIMESTAMP', 'REQUIRED', ''],
       ['session_id', 'STRING', 'NULLABLE', 'One per web app visit'],
       ['video_id', 'STRING', 'REQUIRED', ''],
-      ['event_type', 'STRING', 'REQUIRED', 'impression | watch | skip'],
+      ['event_type', 'STRING', 'REQUIRED', 'watch | skip | error (moved on after 3 s or more / sooner / player error)'],
       ['watch_ms', 'INT64', 'NULLABLE', 'Time on the video before moving on'],
       ['position', 'INT64', 'NULLABLE', 'Index of the video in the feed'],
       ['topic', 'STRING', 'NULLABLE', ''],

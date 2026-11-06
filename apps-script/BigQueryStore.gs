@@ -156,11 +156,7 @@ function bqQuery_(cfg, sql, params) {
     query: sql,
     useLegacySql: false,
     parameterMode: 'NAMED',
-    queryParameters: Object.keys(params || {}).map(name => ({
-      name,
-      parameterType: { type: typeof params[name] === 'number' ? 'INT64' : typeof params[name] === 'boolean' ? 'BOOL' : 'STRING' },
-      parameterValue: { value: String(params[name]) },
-    })),
+    queryParameters: bqParams_(params),
     timeoutMs: 30000,
     maxResults: 10000,
   };
@@ -194,4 +190,45 @@ function bqRow_(fields, row) {
     else out[f.name] = v;
   });
   return out;
+}
+
+/** Named query parameters: numbers → INT64, booleans → BOOL, arrays → ARRAY<STRING>, else STRING. */
+function bqParams_(params) {
+  return Object.keys(params || {}).map(name => {
+    const v = params[name];
+    if (Array.isArray(v)) {
+      return { name, parameterType: { type: 'ARRAY', arrayType: { type: 'STRING' } },
+        parameterValue: { arrayValues: v.map(x => ({ value: String(x) })) } };
+    }
+    const type = typeof v === 'number' ? 'INT64' : typeof v === 'boolean' ? 'BOOL' : 'STRING';
+    return { name, parameterType: { type }, parameterValue: { value: String(v) } };
+  });
+}
+
+/**
+ * Replaces a table's contents with a query result (a query job with WRITE_TRUNCATE).
+ * Not DML, so it works in the sandbox. Returns the table's new row count.
+ */
+function bqQueryToTable_(cfg, sql, params, tableName) {
+  const projectId = cfg.BQ_PROJECT_ID;
+  const query = {
+    query: sql,
+    useLegacySql: false,
+    parameterMode: 'NAMED',
+    queryParameters: bqParams_(params),
+    destinationTable: { projectId, datasetId: cfg.BQ_DATASET, tableId: tableName },
+    writeDisposition: 'WRITE_TRUNCATE',
+    createDisposition: 'CREATE_NEVER',
+  };
+  if (TABLES[tableName].clusterFields) query.clustering = { fields: TABLES[tableName].clusterFields };
+  let res = BigQuery.Jobs.insert({ configuration: { query } }, projectId);
+  const ref = res.jobReference;
+  const deadline = Date.now() + 2 * 60 * 1000;
+  while (res.status.state !== 'DONE') {
+    if (Date.now() > deadline) throw new Error(`BigQuery job ${ref.jobId} is still running after 2 minutes.`);
+    Utilities.sleep(1000);
+    res = BigQuery.Jobs.get(projectId, ref.jobId, { location: ref.location });
+  }
+  if (res.status.errorResult) throw new Error(`Rebuilding ${tableName} failed: ${res.status.errorResult.message}`);
+  return Number(BigQuery.Tables.get(projectId, cfg.BQ_DATASET, tableName).numRows) || 0;
 }

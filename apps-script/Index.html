@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<base target="_top">
+<style>
+  :root { --fg: #fff; --muted: rgba(255,255,255,.72); --chip: rgba(255,255,255,.16); --good: #7ee2a0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: #000; color: var(--fg); overflow: hidden;
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
+  #feed { height: 100vh; height: 100dvh; overflow-y: scroll; scroll-snap-type: y mandatory;
+    overscroll-behavior: contain; scrollbar-width: none; }
+  #feed::-webkit-scrollbar { display: none; }
+  .card { position: relative; height: 100vh; height: 100dvh; scroll-snap-align: start; scroll-snap-stop: always;
+    display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  .bg { position: absolute; inset: -40px; background: #111 center / cover no-repeat; filter: blur(28px) brightness(.4); }
+  .stage { position: relative; height: 100%; width: min(100vw, calc(100dvh * 9 / 16)); background: #000; }
+  .stage img { width: 100%; height: 100%; object-fit: cover; opacity: .9; }
+  .stage .player, .stage iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  .meta { position: absolute; left: 0; right: 0; bottom: 0; padding: 72px 16px calc(64px + env(safe-area-inset-bottom));
+    background: linear-gradient(transparent, rgba(0,0,0,.85)); pointer-events: none; transition: opacity .4s; }
+  .playing .meta { opacity: 0; transition: opacity .6s 3s; } /* title fades 3 s into the video */
+  .card.paused .meta { opacity: 1; transition: opacity .2s; } /* tap to pause: title comes back */
+  .title { font-weight: 650; font-size: 16px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .why { display: inline-flex; gap: 8px; align-items: baseline; margin-top: 10px; padding: 5px 11px; border-radius: 14px;
+    background: var(--chip); font-size: 12.5px; backdrop-filter: blur(6px); max-width: 100%; }
+  .why b { color: var(--good); white-space: nowrap; }
+  #top { position: fixed; top: 0; left: 0; right: 0; z-index: 5; display: flex; justify-content: space-between; align-items: center;
+    padding: calc(12px + env(safe-area-inset-top)) 16px 18px; background: linear-gradient(rgba(0,0,0,.65), transparent);
+    pointer-events: none; font-weight: 700; letter-spacing: .2px; }
+  #top .topic { font-weight: 500; color: var(--muted); margin-left: 6px; }
+  #count { font-weight: 500; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .end { flex-direction: column; gap: 14px; text-align: center; padding: 32px; }
+  .end h2 { font-size: 22px; }
+  .end p { color: var(--muted); max-width: 30ch; }
+  button { font: inherit; font-weight: 650; color: #000; background: #fff; border: 0; border-radius: 999px; padding: 11px 20px; cursor: pointer; }
+  .spinner { width: 28px; height: 28px; border-radius: 50%; border: 3px solid rgba(255,255,255,.2); border-top-color: #fff; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } .meta { transition: none; } }
+</style>
+</head>
+<body>
+<div id="top"><span>FocusFeed<span class="topic" id="topic"></span></span><span id="count"></span></div>
+<main id="feed">
+  <section class="card end" id="status"><div class="spinner" role="status" aria-label="Loading"></div></section>
+</main>
+<script>
+(function () {
+  'use strict';
+  var feed = document.getElementById('feed');
+  var state = {
+    session: rand(), seed: rand(), videos: [], cards: [], active: -1, shownAt: 0,
+    loading: false, more: true, includeSeen: false, events: [], player: null, wantsSound: false, ytReady: false,
+  };
+
+  function rand() { return Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 6); }
+  function el(tag, cls, text) { var n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
+  function call(fn, arg) {
+    return new Promise(function (ok, fail) { google.script.run.withSuccessHandler(ok).withFailureHandler(fail)[fn](arg); });
+  }
+  function fmt(sec) { sec = Math.round(sec || 0); return Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0'); }
+
+  /* ---------- YouTube IFrame API (falls back to a plain embed if it can't load) ---------- */
+  window.onYouTubeIframeAPIReady = function () { state.ytReady = true; };
+  var api = document.createElement('script');
+  api.src = 'https://www.youtube.com/iframe_api';
+  document.head.appendChild(api);
+
+  /* ---------- loading pages ---------- */
+  function loadMore() {
+    if (state.loading || !state.more) return;
+    state.loading = true;
+    call('getFeedPage', { exclude: state.videos.map(function (v) { return v.id; }), seed: state.seed, includeSeen: state.includeSeen })
+      .then(function (page) {
+        document.getElementById('topic').textContent = page.topic ? '\u00B7 ' + page.topic : '';
+        page.videos.forEach(addCard);
+        state.more = page.more;
+        removeStatus();
+        if (!state.more) showEnd();
+        updateCount();
+      })
+      .catch(function (err) { showError(err && err.message ? err.message : String(err)); })
+      .then(function () { state.loading = false; });
+  }
+
+  function addCard(v) {
+    var i = state.videos.length;
+    state.videos.push(v);
+    var card = el('section', 'card');
+    card.dataset.index = i;
+    var bg = el('div', 'bg');
+    bg.style.backgroundImage = 'url(https://i.ytimg.com/vi/' + v.id + '/hqdefault.jpg)';
+    var stage = el('div', 'stage');
+    var img = el('img');
+    img.alt = '';
+    img.loading = 'lazy';
+    img.src = 'https://i.ytimg.com/vi/' + v.id + '/hqdefault.jpg';
+    stage.appendChild(img);
+    var meta = el('div', 'meta');
+    meta.appendChild(el('div', 'title', v.title));
+    meta.appendChild(el('div', 'sub', v.channel + ' \u00B7 ' + fmt(v.seconds)));
+    var why = el('div', 'why');
+    why.appendChild(el('b', null, v.score + '/10'));
+    why.appendChild(el('span', null, v.reason));
+    meta.appendChild(why);
+    card.appendChild(bg);
+    card.appendChild(stage);
+    card.appendChild(meta);
+    var status = document.getElementById('status');
+    feed.insertBefore(card, status && status.parentNode === feed ? status : null);
+    state.cards.push(card);
+    observer.observe(card);
+  }
+
+  function removeStatus() { var s = document.getElementById('status'); if (s && !s.dataset.keep) s.remove(); }
+
+  function statusCard(html) {
+    var s = document.getElementById('status');
+    if (!s) { s = el('section', 'card end'); s.id = 'status'; feed.appendChild(s); }
+    s.dataset.keep = '1';
+    s.innerHTML = '';
+    html.forEach(function (n) { s.appendChild(n); });
+    return s;
+  }
+
+  function showEnd() {
+    var none = state.videos.length === 0;
+    var btn = el('button', null, none ? 'Show everything again' : 'Watch the best again');
+    btn.onclick = restart;
+    statusCard([
+      el('h2', null, none ? 'Nothing new yet' : 'You\u2019re all caught up'),
+      el('p', null, none ? 'New videos arrive after the daily collect and score runs.' : 'New videos arrive after tomorrow\u2019s collect and score runs.'),
+      btn,
+    ]);
+  }
+
+  function showError(message) {
+    var btn = el('button', null, 'Try again');
+    btn.onclick = function () { statusCard([el('div', 'spinner')]); loadMore(); };
+    statusCard([el('h2', null, 'Couldn\u2019t load the feed'), el('p', null, message), btn]);
+  }
+
+  function restart() {
+    finishActive();
+    flush();
+    state.cards.forEach(function (c) { observer.unobserve(c); c.remove(); });
+    state.cards = []; state.videos = []; state.active = -1;
+    state.more = true; state.includeSeen = true; state.seed = rand();
+    statusCard([el('div', 'spinner')]).dataset.keep = '';
+    feed.scrollTop = 0;
+    loadMore();
+  }
+
+  /* ---------- the active video ---------- */
+  var observer = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) { if (e.isIntersecting && e.intersectionRatio >= 0.6) activate(Number(e.target.dataset.index)); });
+  }, { root: feed, threshold: [0.6] });
+
+  function activate(i) {
+    if (i === state.active || !state.videos[i]) return;
+    finishActive();
+    state.active = i;
+    state.shownAt = Date.now();
+    var card = state.cards[i];
+    // Give the YouTube API up to 1.5 s to load for the very first video, then fall back.
+    if (!state.ytReady && !state.ytWaited) {
+      setTimeout(function () { state.ytWaited = true; if (state.cards[state.active] === card) mountPlayer(card, state.videos[i]); }, 1500);
+    } else {
+      mountPlayer(card, state.videos[i]);
+    }
+    updateCount();
+    if (i >= state.videos.length - 8) loadMore();
+  }
+
+  function finishActive() {
+    var i = state.active;
+    if (i < 0 || !state.videos[i]) return;
+    var ms = Date.now() - state.shownAt;
+    var errored = state.cards[i].dataset.error === '1';
+    track(state.videos[i].id, errored ? 'error' : ms < 3000 ? 'skip' : 'watch', ms, i);
+    if (state.player && state.player.isMuted) { try { state.wantsSound = !state.player.isMuted(); } catch (e) {} }
+    unmountPlayer(state.cards[i]);
+    state.active = -1;
+  }
+
+  function mountPlayer(card, v) {
+    var stage = card.querySelector('.stage');
+    var host = el('div', 'player');
+    stage.appendChild(host);
+    card.classList.add('playing');
+    if (state.ytReady && window.YT && YT.Player) {
+      state.player = new YT.Player(host, {
+        videoId: v.id,
+        playerVars: { autoplay: 1, playsinline: 1, rel: 0, modestbranding: 1, loop: 1, playlist: v.id, mute: state.wantsSound ? 0 : 1 },
+        events: {
+          onReady: function (e) { e.target.playVideo(); },
+          onStateChange: function (e) { card.classList.toggle('paused', e.data === 2); },
+          onError: function () { card.dataset.error = '1'; setTimeout(function () { if (state.cards[state.active] === card) next(); }, 1200); },
+        },
+      });
+    } else {
+      var f = document.createElement('iframe');
+      f.src = 'https://www.youtube.com/embed/' + v.id + '?autoplay=1&mute=1&playsinline=1&rel=0&loop=1&playlist=' + v.id;
+      f.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen';
+      f.referrerPolicy = 'strict-origin-when-cross-origin';
+      f.title = v.title;
+      host.appendChild(f);
+      state.player = null;
+    }
+  }
+
+  function unmountPlayer(card) {
+    if (state.player && state.player.destroy) { try { state.player.destroy(); } catch (e) {} }
+    state.player = null;
+    var p = card.querySelector('.player');
+    if (p) p.remove();
+    card.classList.remove('playing', 'paused');
+  }
+
+  function next() { var c = state.cards[state.active + 1]; if (c) c.scrollIntoView({ behavior: 'smooth' }); }
+  function prev() { var c = state.cards[state.active - 1]; if (c) c.scrollIntoView({ behavior: 'smooth' }); }
+
+  function updateCount() {
+    var n = state.videos.length;
+    document.getElementById('count').textContent = n ? (Math.max(state.active, 0) + 1) + ' / ' + n + (state.more ? '+' : '') : '';
+  }
+
+  /* ---------- events: what was watched or skipped ---------- */
+  function track(id, type, ms, position) {
+    state.events.push({ video_id: id, event_type: type, watch_ms: ms, position: position, session_id: state.session, at: new Date().toISOString() });
+    if (state.events.length >= 10) flush();
+  }
+  function flush() {
+    if (!state.events.length) return;
+    var batch = state.events.splice(0, state.events.length);
+    call('logEvents', batch).catch(function () { state.events = batch.concat(state.events).slice(-200); });
+  }
+  setInterval(flush, 15000);
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') flush(); });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowDown' || e.key === 'j') { e.preventDefault(); next(); }
+    if (e.key === 'ArrowUp' || e.key === 'k') { e.preventDefault(); prev(); }
+  });
+
+  window.__focusfeed = state; // for debugging in the browser console
+  loadMore();
+})();
+</script>
+</body>
+</html>
