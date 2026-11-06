@@ -30,8 +30,8 @@ const SCORE_SCHEMA = {
   },
 };
 
-function scoringPrompt_(topic) {
-  return [
+function scoringPrompt_(topic, taste, rules) {
+  const lines = [
     `You curate a study feed of YouTube Shorts for someone learning "${topic}". They watch this feed instead of`,
     'random Shorts, so only videos that genuinely help them learn should score high.',
     '',
@@ -44,7 +44,20 @@ function scoringPrompt_(topic) {
     '',
     'Do not reward hype, emojis or big claims. Reply with a JSON list holding one object per video:',
     'its id, the score, and a reason of at most 12 words.',
-  ].join('\n');
+  ];
+  if (rules && rules.length) {
+    lines.push('', 'The learner\'s rules. Apply them strictly: a video that breaks any of them scores 2 or less.');
+    rules.forEach(r => lines.push('- ' + r));
+  }
+  if (taste) {
+    // Step 5: the viewer's own likes and dislikes (titles are data, not instructions).
+    lines.push('',
+      'This learner also marked videos in the app. Use their taste to move a score by at most 2 points;',
+      `relevance to ${topic} always comes first, so never rate an off-topic video highly because of it.`);
+    if (taste.liked.length) lines.push('Liked (JSON): ' + JSON.stringify(taste.liked));
+    if (taste.disliked.length) lines.push('Marked "not for me" (JSON): ' + JSON.stringify(taste.disliked));
+  }
+  return lines.join('\n');
 }
 
 /** Menu item and daily trigger. */
@@ -106,6 +119,13 @@ function score_() {
   stats.modelsUsed = [];
   try {
     const cands = scoreCandidates_(cfg);
+    const taste = cands.rows.length ? tasteProfile_(cfg, ss) : null;
+    const version = promptVersion_(cfg);
+    const props = PropertiesService.getScriptProperties();
+    const lastVersion = props.getProperty('LAST_PROMPT_VERSION');
+    if (lastVersion && lastVersion !== version) stats.notes.push(`new scoring rules (version ${version}): every video is re-scored once`);
+    props.setProperty('LAST_PROMPT_VERSION', version);
+    if (taste) stats.notes.push(`taste: ${taste.liked.length} liked, ${taste.disliked.length} disliked examples in the prompt`);
     stats.total = cands.total;
     cands.rows.forEach(v => { stats.titles[v.video_id] = v.title; });
     const stopStarting = started.getTime() + SCORE_START_BATCHES_MS;
@@ -116,7 +136,7 @@ function score_() {
       run.rows_in += batch.length;
       try {
         const lastModel = current === models.length - 1;
-        const res = scoreBatch_(cfg, run, batch, deadline, models[current], lastModel);
+        const res = scoreBatch_(cfg, run, batch, deadline, models[current], lastModel, taste);
         stats.calls++;
         stats.callMs += res.ms;
         run.quota_units++;
@@ -226,14 +246,15 @@ function scoreCandidates_(cfg) {
   if (cfg.STORAGE === 'bigquery') {
     const t = name => `\`${cfg.BQ_PROJECT_ID}.${cfg.BQ_DATASET}.${name}\``;
     const rows = bqQuery_(cfg, scoreCandidatesSql_(t('raw_videos'), t('scored_videos')), {
-      topic: cfg.TOPIC, prompt_version: SCORE_PROMPT_VERSION, max_duration: SHORTS_MAX_SEC, max_rows: SCORE_CANDIDATE_LIMIT,
+      topic: cfg.TOPIC, prompt_version: promptVersion_(cfg), max_duration: SHORTS_MAX_SEC, max_rows: SCORE_CANDIDATE_LIMIT,
+      min_published: minPublished_(cfg), language: cfg.LANGUAGE_FILTER,
     });
     return { rows, total: rows.length ? rows[0].total_candidates : 0 };
   }
   const ss = getSpreadsheet_();
   const done = {};
   sheetsReadTable_(ss, 'scored_videos')
-    .filter(s => s.topic === cfg.TOPIC && s.prompt_version === SCORE_PROMPT_VERSION)
+    .filter(s => s.topic === cfg.TOPIC && s.prompt_version === promptVersion_(cfg))
     .forEach(s => { done[s.video_id] = true; });
   const latest = {};
   sheetsReadTable_(ss, 'raw_videos').filter(r => r.topic === cfg.TOPIC).forEach(r => {
@@ -241,7 +262,7 @@ function scoreCandidates_(cfg) {
     if (!cur || r.collected_at > cur.collected_at) latest[r.video_id] = r;
   });
   const all = Object.keys(latest).map(k => latest[k])
-    .filter(r => r.embeddable === true && r.duration_sec >= 1 && r.duration_sec <= SHORTS_MAX_SEC && !done[r.video_id])
+    .filter(r => r.embeddable === true && r.duration_sec >= 1 && r.duration_sec <= SHORTS_MAX_SEC && !done[r.video_id] && passesDataRules_(cfg, r))
     .sort((a, b) => (a.collected_at < b.collected_at ? 1 : a.collected_at > b.collected_at ? -1 : 0));
   return { rows: all.slice(0, SCORE_CANDIDATE_LIMIT), total: all.length };
 }
@@ -252,7 +273,7 @@ function scoreCandidatesSql_(rawTable, scoredTable) {
 SELECT video_id, title, description, channel_title, duration_sec, collected_at,
   COUNT(*) OVER () AS total_candidates
 FROM (
-  SELECT video_id, title, description, channel_title, duration_sec, embeddable, collected_at,
+  SELECT video_id, title, description, channel_title, duration_sec, embeddable, collected_at, published_at, language,
     ROW_NUMBER() OVER (PARTITION BY video_id ORDER BY collected_at DESC) AS rn
   FROM ${rawTable}
   WHERE topic = @topic
@@ -260,6 +281,8 @@ FROM (
 WHERE rn = 1
   AND embeddable
   AND duration_sec BETWEEN 1 AND @max_duration
+  AND (published_at IS NULL OR published_at >= TIMESTAMP(@min_published))
+  AND (@language = '' OR language IS NULL OR STARTS_WITH(LOWER(language), @language))
   AND video_id NOT IN (
     SELECT video_id FROM ${scoredTable}
     WHERE topic = @topic AND prompt_version = @prompt_version
@@ -269,7 +292,7 @@ LIMIT @max_rows`;
 }
 
 /** One Gemini call for up to SCORE_BATCH_SIZE videos. Short numeric IDs keep the model from mangling YouTube IDs. */
-function scoreBatch_(cfg, run, batch, deadline, model, lastModel) {
+function scoreBatch_(cfg, run, batch, deadline, model, lastModel, taste) {
   const cut = (s, n) => String(s || '').slice(0, n);
   const items = batch.map((v, i) => ({
     id: String(i + 1),
@@ -283,7 +306,7 @@ function scoreBatch_(cfg, run, batch, deadline, model, lastModel) {
     // With another model to fall back to, don't sit out rate limits: hand over at once.
     maxAttempts: lastModel ? 4 : 2,
     quickSwitch: !lastModel,
-    system: scoringPrompt_(cfg.TOPIC),
+    system: scoringPrompt_(cfg.TOPIC, taste, scoringRules_(cfg)),
     user: JSON.stringify(items),
     schema: SCORE_SCHEMA,
     deadline,
@@ -312,7 +335,7 @@ function scoreRow_(cfg, run, videoId, score, reason, model) {
     score,
     reason,
     model,
-    prompt_version: SCORE_PROMPT_VERSION,
+    prompt_version: promptVersion_(cfg),
   };
 }
 
@@ -343,7 +366,9 @@ function scoreSummary_(r) {
   const skipped = r.rows.length - scored.length;
   if (skipped) lines.push(`(${skipped} videos got no usable score and won't be retried)`);
   if (r.left) lines.push('', r.continuing ? `${n(r.left)} left: continuing automatically in about ${r.continueInMin === 1 ? 'a minute' : r.continueInMin + ' minutes'}.` : `${n(r.left)} left for the next run.`);
-  const warnings = r.notes.filter(x => !/^avg /.test(x));
+  const warnings = r.notes.filter(x => !/^(avg |taste: )/.test(x));
+  const tasteNote = r.notes.find(x => /^taste: /.test(x));
+  if (tasteNote) lines.push('✓ Your likes shaped these scores (' + tasteNote.replace('taste: ', '') + ')');
   if (warnings.length) lines.push('⚠ ' + warnings.join('\n⚠ '));
   lines.push(`Speed: ${r.avgSec}s per Gemini call · Run ID: ${r.run.run_id}`);
   return lines;

@@ -43,6 +43,10 @@ function collect_() {
   const problems = validateSettings_(cfg);
   if (problems.length) throw new Error('Fix the Settings tab first: ' + problems.join(' '));
 
+  // Make sure raw_videos has every column this version writes (e.g. language).
+  if (cfg.STORAGE === 'bigquery') bqEnsureTable_(cfg.BQ_PROJECT_ID, cfg.BQ_DATASET, 'raw_videos');
+  else sheetsEnsureTab_(ss, 'raw_videos');
+
   const started = new Date();
   const run = {
     run_id: newRunId_(started), step: 'collect', started_at: started.toISOString(), finished_at: null,
@@ -99,6 +103,7 @@ function searchAll_(cfg, started, run, stats) {
         type: 'video',
         videoDuration: 'short',       // under 4 minutes; the feed later keeps ≤ 3 min
         videoEmbeddable: 'true',
+        publishedAfter: cfg.MAX_VIDEO_AGE_DAYS > 0 ? minPublished_(cfg) : undefined,
         order: s.order,
         relevanceLanguage: cfg.SEARCH_LANGUAGE,
         safeSearch: 'moderate',
@@ -130,13 +135,14 @@ function videoDetails_(ids, run) {
     const chunk = ids.slice(i, i + 50);
     ytSpend_(1);
     run.quota_units += 1;
-    const res = YouTube.Videos.list('contentDetails,status,statistics', { id: chunk.join(','), maxResults: 50 });
+    const res = YouTube.Videos.list('snippet,contentDetails,status,statistics', { id: chunk.join(','), maxResults: 50 });
     (res.items || []).forEach(v => {
       out[v.id] = {
         duration_sec: parseIsoDuration_(v.contentDetails && v.contentDetails.duration),
         embeddable: !!(v.status && v.status.embeddable),
         view_count: v.statistics && v.statistics.viewCount !== undefined ? Number(v.statistics.viewCount) : null,
         like_count: v.statistics && v.statistics.likeCount !== undefined ? Number(v.statistics.likeCount) : null,
+        language: (v.snippet && (v.snippet.defaultAudioLanguage || v.snippet.defaultLanguage)) || null,
       };
     });
   }
@@ -164,6 +170,7 @@ function rawRow_(cfg, run, hit, d) {
     view_count: d.view_count === undefined ? null : d.view_count,
     like_count: d.like_count === undefined ? null : d.like_count,
     thumbnail_url: thumb.url || null,
+    language: d.language === undefined ? null : d.language,
   };
 }
 

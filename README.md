@@ -4,7 +4,7 @@ A swipe feed of YouTube Shorts about **one topic you choose**, so scrolling beco
 
 Under the hood it's a small data pipeline. A daily job collects Shorts from the YouTube Data API, Gemini scores each one for relevance, and the results go through `raw → scored → feed` tables. A mobile web app serves the feed and logs what you watch or skip, and that feeds back into the pipeline. It runs entirely on free tiers, and anyone can run their own copy.
 
-> **Status: Phase 1, in progress.** Done so far: Settings tab, Setup menu (spreadsheet tabs or BigQuery tables), tests, GitHub → Apps Script deploys, step 1 (daily collect), step 2 (Gemini scoring), step 3 (feed build) and step 4 (the swipe web app, v1). Next up: the nightly events load into BigQuery and using watch/skip signals.
+> **Status: Phase 1, in progress.** Done so far: Settings tab, Setup menu (spreadsheet tabs or BigQuery tables), tests, GitHub → Apps Script deploys, step 1 (daily collect), step 2 (Gemini scoring), step 3 (feed build), step 4 (the swipe web app) and step 5 (learning from likes, dislikes, watches and skips). Phase 1 is feature-complete; Phase 2 (Python + dbt) starts in January.
 
 ## How it works
 
@@ -26,7 +26,7 @@ flowchart LR
 | 2. Score | Gemini rates each new feed-eligible video (embeddable, ≤ 3 min) 0–10 for how useful it is for learning the topic, 25 per call, with a one-line reason. Each video is scored once per prompt version. If a model is overloaded or out of quota it switches to the next model in `GEMINI_FALLBACK_MODELS`; scores are saved every 2 batches, and a run near Apps Script's 6-minute limit pauses and continues itself a minute later | An hour after collect |
 | 3. Store | `raw_videos` → `scored_videos` → `feed`, plus `pipeline_runs` for monitoring | Each run |
 | 4. Show | Swipe UI with embedded players. Opens on a phone with no login | On demand |
-| 5. Learn | Watches and skips land in the `events` tab and get batch-loaded nightly | Nightly |
+| 5. Learn | Likes and longer watches lift a channel in your feed, dislikes and quick skips lower it (at most ±2 points, so relevance still leads). New videos are scored with your liked / disliked titles in Gemini's prompt. With BigQuery, new events are batch-loaded into `events` every night | Page load / score run / ~02:00 |
 
 Each step is a separate job. Phase 2 swaps steps 1–3 for Python, dbt and an orchestrator, and the UI stays the same.
 
@@ -76,6 +76,10 @@ Everything is configured in the **Settings** tab. Setup adds any new settings wi
 | `SEARCHES_PER_DAY` | `50` | 100 quota units each, out of 10,000 a day. Maximum is 90 |
 | `COLLECT_HOUR` | `14` | Hour of the daily collect, in the script's time zone. YouTube's quota resets at midnight Pacific (about 13:30 in India) |
 | `MIN_SCORE` | `7` | Lowest Gemini score (0–10) that reaches the feed |
+| `MAX_VIDEO_AGE_DAYS` | `0` | Only videos published in the last N days (730 = 2 years); also narrows searches. 0 = any age |
+| `LANGUAGE_FILTER` | | e.g. `en`: only videos in that language (YouTube's audio language where known; Gemini checks the rest) |
+| `EXCLUDE_ADS` | `yes` | Videos that mainly advertise a course, coaching, app or discount score 2 or less |
+| `SCORING_GUIDANCE` | | Your own rules for Gemini in plain words. Changing it (or the two rows above) re-scores every video once |
 | `SCORE_BATCH_SIZE` | `25` | Videos per Gemini call |
 | `GEMINI_MODEL` | `gemini-flash-latest` | An alias for the newest Flash model. Put a specific model name here to pin one |
 | `GEMINI_FALLBACK_MODELS` | `gemini-flash-lite-latest, gemini-2.5-flash` | Tried in order when the main model is overloaded, rate-limited, out of daily quota or not found. `none` turns fallback off |
@@ -132,6 +136,7 @@ apps-script/
   Gemini.gs         Gemini client: JSON-schema output, retries, rate-limit handling
   Score.gs          step 2: unscored candidates → Gemini in batches → scored_videos
   Feed.gs           step 3: latest score ≥ MIN_SCORE → feed; step 4: doGet, getFeedPage, logEvents
+  Learn.gs          step 5: viewer signals, channel boost, taste profile for scoring, nightly events load
   Index.html        the swipe page: scroll-snap cards, YouTube IFrame API player, event logging
   Setup.gs          FocusFeed menu: Setup, Gemini key, Run collect/score now, Build feed now, Open feed, Check setup, sandbox reminder
 tests/gas.test.js   runs the real .gs files against in-memory fakes of Google services

@@ -20,6 +20,14 @@ const SETTINGS = [
     note: 'Hour of the day (script time zone) for the daily collect run. YouTube quota resets at midnight Pacific time (about 13:30 in India), so 14 starts each run with a full day of quota. Run Setup after changing.' },
   { key: 'MIN_SCORE', def: 7, type: 'int', min: 0, max: 10,
     note: 'Gemini scores every video 0-10 for how well it fits TOPIC. Only videos at or above this reach the feed.' },
+  { key: 'MAX_VIDEO_AGE_DAYS', def: 0, type: 'int', min: 0, max: 3650,
+    note: 'Only videos published in the last N days (730 = 2 years). 0 = any age. Also narrows the YouTube searches.' },
+  { key: 'LANGUAGE_FILTER', def: '', type: 'string', pattern: /^([a-z]{2})?$/,
+    note: 'Two-letter code, e.g. en: only videos in that language (YouTube\'s audio language where known; Gemini checks the rest). Blank = any language.' },
+  { key: 'EXCLUDE_ADS', def: 'yes', type: 'enum', options: ['yes', 'no'],
+    note: 'yes = videos that mainly advertise a course, coaching, app, book or discount score 2 or less, so they never reach the feed.' },
+  { key: 'SCORING_GUIDANCE', def: '', type: 'string', maxLength: 2000,
+    note: 'Your own rules for Gemini in plain words, e.g. "Only the new TOEFL format from January 2026…". Changing this, LANGUAGE_FILTER or EXCLUDE_ADS re-scores every video once.' },
   { key: 'SCORE_BATCH_SIZE', def: 25, type: 'int', min: 1, max: 50,
     note: 'Videos sent to Gemini in one call.' },
   { key: 'GEMINI_MODEL', def: 'gemini-flash-latest', type: 'string',
@@ -142,6 +150,7 @@ function validateSettings_(cfg) {
       errors.push(`${s.key} must be one of: ${s.options.join(', ')}.`);
     }
     if (s.pattern && v && !s.pattern.test(v)) errors.push(`${s.key} "${v}" doesn't look right.`);
+    if (s.maxLength && v && String(v).length > s.maxLength) errors.push(`${s.key} is longer than ${s.maxLength} characters.`);
   });
   if (cfg.STORAGE === 'bigquery') {
     if (!cfg.BQ_PROJECT_ID) {

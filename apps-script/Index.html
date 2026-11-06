@@ -118,7 +118,7 @@
     stage.appendChild(img);
     var meta = el('div', 'meta');
     meta.appendChild(el('div', 'title', v.title));
-    meta.appendChild(el('div', 'sub', v.channel + ' \u00B7 ' + fmt(v.seconds)));
+    meta.appendChild(el('div', 'sub', v.channel + ' \u00B7 ' + fmt(v.seconds) + (v.boosted ? ' \u00B7 \u2665 a channel you like' : '')));
     var why = el('div', 'why');
     why.appendChild(el('b', null, v.score + '/10'));
     why.appendChild(el('span', null, v.reason));

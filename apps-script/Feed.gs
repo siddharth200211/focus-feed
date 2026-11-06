@@ -43,7 +43,8 @@ function buildFeed_(cfg) {
     if (cfg.STORAGE === 'bigquery') {
       const t = name => `\`${cfg.BQ_PROJECT_ID}.${cfg.BQ_DATASET}.${name}\``;
       run.rows_out = bqQueryToTable_(cfg, buildFeedSql_(t('raw_videos'), t('scored_videos')), {
-        topic: cfg.TOPIC, prompt_version: SCORE_PROMPT_VERSION, min_score: cfg.MIN_SCORE, max_duration: SHORTS_MAX_SEC,
+        topic: cfg.TOPIC, prompt_version: promptVersion_(cfg), min_score: cfg.MIN_SCORE, max_duration: SHORTS_MAX_SEC,
+        min_published: minPublished_(cfg), language: cfg.LANGUAGE_FILTER,
       }, 'feed');
     } else {
       const rows = buildFeedRows_(cfg, sheetsReadTable_(ss, 'raw_videos'), sheetsReadTable_(ss, 'scored_videos'), started);
@@ -73,9 +74,9 @@ WITH latest_score AS (
   WHERE rn = 1
 ),
 latest_raw AS (
-  SELECT video_id, title, channel_title, duration_sec, published_at, embeddable, first_seen_at
+  SELECT video_id, title, channel_title, duration_sec, published_at, embeddable, language, first_seen_at
   FROM (
-    SELECT video_id, title, channel_title, duration_sec, published_at, embeddable,
+    SELECT video_id, title, channel_title, duration_sec, published_at, embeddable, language,
       MIN(collected_at) OVER (PARTITION BY video_id) AS first_seen_at,
       ROW_NUMBER() OVER (PARTITION BY video_id ORDER BY collected_at DESC) AS rn
     FROM ${rawTable}
@@ -89,13 +90,15 @@ FROM latest_raw AS r
 JOIN latest_score AS s USING (video_id)
 WHERE s.score >= @min_score
   AND r.embeddable
-  AND r.duration_sec BETWEEN 1 AND @max_duration`;
+  AND r.duration_sec BETWEEN 1 AND @max_duration
+  AND (r.published_at IS NULL OR r.published_at >= TIMESTAMP(@min_published))
+  AND (@language = '' OR r.language IS NULL OR STARTS_WITH(LOWER(r.language), @language))`;
 }
 
 /** The same logic in JavaScript, for sheets storage. */
 function buildFeedRows_(cfg, raw, scored, now) {
   const latestScore = {};
-  scored.filter(s => s.topic === cfg.TOPIC && s.prompt_version === SCORE_PROMPT_VERSION && s.score !== null && s.score !== '')
+  scored.filter(s => s.topic === cfg.TOPIC && s.prompt_version === promptVersion_(cfg) && s.score !== null && s.score !== '')
     .forEach(s => {
       const cur = latestScore[s.video_id];
       if (!cur || s.scored_at > cur.scored_at) latestScore[s.video_id] = s;
@@ -110,7 +113,7 @@ function buildFeedRows_(cfg, raw, scored, now) {
   return Object.keys(latestScore)
     .map(id => ({ s: latestScore[id], r: latestRaw[id] }))
     .filter(x => x.r && Number(x.s.score) >= cfg.MIN_SCORE && x.r.embeddable === true &&
-      x.r.duration_sec >= 1 && x.r.duration_sec <= SHORTS_MAX_SEC)
+      x.r.duration_sec >= 1 && x.r.duration_sec <= SHORTS_MAX_SEC && passesDataRules_(cfg, x.r))
     .map(x => ({
       video_id: x.r.video_id, topic: cfg.TOPIC, title: x.r.title, channel_title: x.r.channel_title,
       duration_sec: x.r.duration_sec, published_at: x.r.published_at, score: Number(x.s.score), reason: x.s.reason,
@@ -139,41 +142,39 @@ function getFeedPage(req) {
   const limit = Math.max(10, Math.min(200, cfg.FEED_PAGE_SIZE || 50));
   const seed = String(req.seed || 'seed').replace(/[^A-Za-z0-9]/g, '').slice(0, 24) || 'seed';
   const signals = viewerSignals_(ss);
-  const exclude = cleanIds_(req.exclude).slice(0, 5000).concat(signals.disliked, req.includeSeen ? [] : signals.seen);
-  const liked = req.includeSeen ? signals.liked : [];
-  let videos;
-  if (cfg.STORAGE === 'bigquery') {
-    videos = bqQuery_(cfg, feedPageSql_(`\`${cfg.BQ_PROJECT_ID}.${cfg.BQ_DATASET}.feed\``), {
-      topic: cfg.TOPIC, exclude: exclude.concat(['-']), liked: liked.concat(['-']), seed, limit,
-    });
-  } else {
-    const skip = {}, love = {};
-    exclude.forEach(id => { skip[id] = true; });
-    liked.forEach(id => { love[id] = 1; });
-    videos = sheetsReadTable_(ss, 'feed')
-      .filter(v => v.topic === cfg.TOPIC && !skip[v.video_id])
-      .sort((a, b) => ((love[b.video_id] || 0) - (love[a.video_id] || 0)) || (Number(b.score) - Number(a.score)) ||
-        (hashStr_(a.video_id + seed) - hashStr_(b.video_id + seed)))
-      .slice(0, limit);
-  }
+  const all = feedRows_(cfg, ss);
+  const affinity = channelAffinity_(all, signals); // step 5: channels you like rank higher
+  const skip = {}, liked = {};
+  cleanIds_(req.exclude).slice(0, 5000).concat(signals.disliked, req.includeSeen ? [] : signals.seen)
+    .forEach(id => { skip[id] = true; });
+  signals.liked.forEach(id => { liked[id] = true; });
+  const rank = v => Number(v.score) + (affinity[v.channel_title] || 0);
+  const page = all
+    .filter(v => !skip[v.video_id])
+    .sort((a, b) => (req.includeSeen ? (liked[b.video_id] ? 1 : 0) - (liked[a.video_id] ? 1 : 0) : 0) ||
+      (rank(b) - rank(a)) || (hashStr_(a.video_id + seed) - hashStr_(b.video_id + seed)))
+    .slice(0, limit);
   return {
     topic: cfg.TOPIC,
-    more: videos.length === limit,
-    videos: videos.map(v => ({
+    more: page.length === limit,
+    videos: page.map(v => ({
       id: v.video_id, title: v.title || '', channel: v.channel_title || '',
       seconds: Number(v.duration_sec) || 0, score: Number(v.score), reason: v.reason || '',
-      liked: signals.liked.indexOf(v.video_id) !== -1,
+      liked: !!liked[v.video_id], boosted: (affinity[v.channel_title] || 0) > 0,
     })),
   };
 }
 
-function feedPageSql_(feedTable) {
-  return `-- focusfeed: feed page
+/** Every feed video for the topic. The feed is small (hundreds to a few thousand rows), so ranking happens here. */
+function feedRows_(cfg, ss) {
+  if (cfg.STORAGE === 'bigquery') {
+    return bqQuery_(cfg, `-- focusfeed: feed rows
 SELECT video_id, title, channel_title, duration_sec, score, reason
-FROM ${feedTable}
-WHERE topic = @topic AND video_id NOT IN UNNEST(@exclude)
-ORDER BY video_id IN UNNEST(@liked) DESC, score DESC, FARM_FINGERPRINT(CONCAT(video_id, @seed))
-LIMIT @limit`;
+FROM \`${cfg.BQ_PROJECT_ID}.${cfg.BQ_DATASET}.feed\`
+WHERE topic = @topic
+LIMIT 5000`, { topic: cfg.TOPIC });
+  }
+  return sheetsReadTable_(ss || getSpreadsheet_(), 'feed').filter(v => v.topic === cfg.TOPIC);
 }
 
 /** Called by the page with a batch of { video_id, event_type, watch_ms, position, session_id, at }. */
@@ -199,25 +200,6 @@ function logEvents(events) {
   }).filter(Boolean);
   if (rows.length) sheetsAppendRowsAtomic_(ss, 'events', rows, cfg.LITE_MAX_ROWS);
   return rows.length;
-}
-
-/**
- * What the viewer told us, from the events tab: seen = watched or skipped in the last
- * FEED_SEEN_DAYS days; liked / disliked = the latest like/unlike and dislike/undislike per video.
- */
-function viewerSignals_(ss) {
-  const since = Date.now() - FEED_SEEN_DAYS * DAY_MS;
-  const seen = {}, like = {}, dislike = {};
-  sheetsReadTable_(ss, 'events')
-    .sort((a, b) => Date.parse(a.event_at) - Date.parse(b.event_at))
-    .forEach(e => {
-      const t = e.event_type;
-      if ((t === 'watch' || t === 'skip') && Date.parse(e.event_at) >= since) seen[e.video_id] = true;
-      if (t === 'like' || t === 'unlike') like[e.video_id] = t === 'like';
-      if (t === 'dislike' || t === 'undislike') dislike[e.video_id] = t === 'dislike';
-    });
-  const on = m => Object.keys(m).filter(k => m[k] === true);
-  return { seen: Object.keys(seen), liked: on(like), disliked: on(dislike) };
 }
 
 function cleanIds_(ids) {

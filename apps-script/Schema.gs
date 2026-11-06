@@ -30,6 +30,7 @@ const TABLES = {
       ['view_count', 'INT64', 'NULLABLE', ''],
       ['like_count', 'INT64', 'NULLABLE', ''],
       ['thumbnail_url', 'STRING', 'NULLABLE', ''],
+      ['language', 'STRING', 'NULLABLE', 'defaultAudioLanguage (or defaultLanguage) from videos.list'],
     ],
   },
   scored_videos: {

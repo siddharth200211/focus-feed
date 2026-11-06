@@ -7,6 +7,7 @@
  *   FocusFeed → Run collect now        pipeline step 1 on demand (it also runs daily)
  *   FocusFeed → Run score now          pipeline step 2 on demand (daily, an hour after collect)
  *   FocusFeed → Build feed now         pipeline step 3 on demand (also runs after every score run)
+ *   FocusFeed → Load events now        step 5: events tab → BigQuery (also runs nightly)
  *   FocusFeed → Open feed              link to the web app (step 4)
  *   FocusFeed → Check setup            read-only health check: account, settings, APIs, tables
  */
@@ -22,6 +23,7 @@ function onOpen() {
     .addItem('Run collect now', 'runCollect')
     .addItem('Run score now', 'runScore')
     .addItem('Build feed now', 'runBuildFeed')
+    .addItem('Load events now', 'runLoadEvents')
     .addSeparator()
     .addItem('Open feed', 'openFeed')
     .addItem('Check setup', 'checkSetup')
@@ -99,6 +101,8 @@ function setupInner_() {
 
   out.push(ensureDailyTrigger_('runCollect', cfg.COLLECT_HOUR, 'Daily collect'));
   out.push(ensureDailyTrigger_('runScore', (cfg.COLLECT_HOUR + 1) % 24, 'Daily score'));
+  if (cfg.STORAGE === 'bigquery') out.push(ensureDailyTrigger_('runLoadEvents', EVENTS_LOAD_HOUR, 'Nightly events load'));
+  else deleteTriggersFor_('runLoadEvents');
 
   if (!props.getProperty(GEMINI_KEY_PROP)) out.push('', 'Next: FocusFeed → Set Gemini API key…');
   tell_('FocusFeed setup done', out);
@@ -163,6 +167,7 @@ function checkSetup() {
     cfg = readSettings_(ss);
     const errors = validateSettings_(cfg);
     out.push(errors.length ? '✗ Settings: ' + errors.join(' ') : `✓ Settings OK (topic: ${cfg.TOPIC}, storage: ${cfg.STORAGE})`);
+    if (!errors.length) out.push('Content rules: ' + rulesSummary_(cfg));
     const missingTabs = dataTabsFor_(cfg.STORAGE).filter(n => !ss.getSheetByName(n));
     out.push(missingTabs.length ? '✗ Missing tabs: ' + missingTabs.join(', ') + ' — run Setup' : '✓ Data tabs present');
   }
@@ -193,6 +198,12 @@ function checkSetup() {
         `${last.status}, ${last.rows} rows${last.message ? ' — ' + last.message : ''}`);
     }
   });
+  if (cfg && cfg.STORAGE === 'bigquery') {
+    const nightly = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'runLoadEvents');
+    out.push(nightly ? `✓ Nightly events load scheduled (around ${EVENTS_LOAD_HOUR}:00)` : '✗ Nightly events load not scheduled — run Setup');
+    const lastLoad = lastRun_('load_events');
+    if (lastLoad) out.push(`${lastLoad.status === 'ok' ? '✓' : '✗'} Last events load: ${String(lastLoad.at).slice(0, 16).replace('T', ' ')} UTC, ${lastLoad.status}, ${lastLoad.rows} events`);
+  }
   const lastFeed = lastRun_('build_feed');
   if (lastFeed) {
     out.push(`${lastFeed.status === 'ok' ? '✓' : '✗'} Last feed build: ${String(lastFeed.at).slice(0, 16).replace('T', ' ')} UTC, ` +

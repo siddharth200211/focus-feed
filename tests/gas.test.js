@@ -141,13 +141,13 @@ function fakeBigQuery({ sandbox = true, projects = ['my-project'] } = {}) {
         assert.equal(req.useLegacySql, false);
         assert.doesNotMatch(req.query, /\b(INSERT|UPDATE|DELETE|MERGE)\b/i, 'no DML in the sandbox');
         const prm = readParams(req.queryParameters);
-        if (/^-- focusfeed: feed page\n/.test(req.query)) return fakeFeedPage(store, p, prm);
+        if (/^-- focusfeed: feed rows\n/.test(req.query)) return fakeFeedRows(store, p, prm);
         assert.match(req.query, /^-- focusfeed: score candidates\nSELECT /, 'read-only SELECT');
-        assert.deepEqual(Object.keys(prm).sort(), ['max_duration', 'max_rows', 'prompt_version', 'topic']);
+        assert.deepEqual(Object.keys(prm).sort(), ['language', 'max_duration', 'max_rows', 'min_published', 'prompt_version', 'topic']);
         const done = new Set((store.rows.scored_videos || []).filter(s => s.topic === prm.topic && s.prompt_version === prm.prompt_version).map(s => s.video_id));
         const latest = {};
         (store.rows.raw_videos || []).filter(r => r.topic === prm.topic).forEach(r => { if (!latest[r.video_id] || r.collected_at > latest[r.video_id].collected_at) latest[r.video_id] = r; });
-        const all = Object.values(latest).filter(r => r.embeddable && r.duration_sec >= 1 && r.duration_sec <= prm.max_duration && !done.has(r.video_id))
+        const all = Object.values(latest).filter(r => r.embeddable && r.duration_sec >= 1 && r.duration_sec <= prm.max_duration && !done.has(r.video_id) && dataRulesOk(r, prm))
           .sort((a, b) => (a.collected_at < b.collected_at ? 1 : a.collected_at > b.collected_at ? -1 : a.video_id < b.video_id ? -1 : 1));
         const fields = [['video_id', 'STRING'], ['title', 'STRING'], ['description', 'STRING'], ['channel_title', 'STRING'], ['duration_sec', 'INTEGER'], ['collected_at', 'TIMESTAMP'], ['total_candidates', 'INTEGER']];
         const rows = all.slice(0, prm.max_rows).map(r => ({ f: fields.map(([n]) => ({ v: n === 'total_candidates' ? String(all.length) : n === 'collected_at' ? String(Date.parse(r.collected_at) / 1000) : r[n] === null ? null : String(r[n]) })) }));
@@ -171,6 +171,13 @@ function fakeBigQuery({ sandbox = true, projects = ['my-project'] } = {}) {
   store.rows = {};
   store.queries = {};
   return store;
+}
+
+/** The SQL age and language filters, in JS (their SQL is checked in DuckDB separately). */
+function dataRulesOk(r, prm) {
+  const ageOk = !r.published_at || Date.parse(r.published_at) >= Date.parse(prm.min_published);
+  const langOk = prm.language === '' || !r.language || r.language.toLowerCase().startsWith(prm.language);
+  return ageOk && langOk;
 }
 
 function readParams(list) {
@@ -198,7 +205,7 @@ function fakeQueryJob(store, job, p) {
     if (!raws[r.video_id] || r.collected_at > raws[r.video_id].collected_at) raws[r.video_id] = r;
     if (!first[r.video_id] || r.collected_at < first[r.video_id]) first[r.video_id] = r.collected_at;
   });
-  store.rows.feed = Object.keys(scores).filter(id => raws[id] && scores[id].score >= prm.min_score && raws[id].embeddable &&
+  store.rows.feed = Object.keys(scores).filter(id => raws[id] && scores[id].score >= prm.min_score && raws[id].embeddable && dataRulesOk(raws[id], prm) &&
     raws[id].duration_sec >= 1 && raws[id].duration_sec <= prm.max_duration).map(id => ({
     video_id: id, topic: prm.topic, title: raws[id].title, channel_title: raws[id].channel_title, duration_sec: raws[id].duration_sec,
     published_at: raws[id].published_at, score: scores[id].score, reason: scores[id].reason, first_seen_at: first[id], built_at: new Date().toISOString(),
@@ -208,14 +215,11 @@ function fakeQueryJob(store, job, p) {
   return { jobReference: { projectId: p, jobId: id, location: 'US' }, status: { state: 'RUNNING' } };
 }
 
-function fakeFeedPage(store, p, prm) {
-  assert.ok(Array.isArray(prm.exclude) && prm.exclude.length >= 1, 'exclude is a non-empty ARRAY<STRING>');
-  assert.ok(Array.isArray(prm.liked) && prm.liked.length >= 1, 'liked is a non-empty ARRAY<STRING>');
-  const skip = new Set(prm.exclude), love = new Set(prm.liked);
-  const rows = (store.rows.feed || []).filter(v => v.topic === prm.topic && !skip.has(v.video_id))
-    .sort((a, b) => (love.has(b.video_id) - love.has(a.video_id)) || b.score - a.score || (a.video_id + prm.seed < b.video_id + prm.seed ? -1 : 1)).slice(0, prm.limit);
+function fakeFeedRows(store, p, prm) {
+  assert.deepEqual(Object.keys(prm), ['topic']);
+  const rows = (store.rows.feed || []).filter(v => v.topic === prm.topic);
   const fields = [['video_id', 'STRING'], ['title', 'STRING'], ['channel_title', 'STRING'], ['duration_sec', 'INTEGER'], ['score', 'INTEGER'], ['reason', 'STRING']];
-  return { jobComplete: true, jobReference: { projectId: p, jobId: 'page', location: 'US' }, schema: { fields: fields.map(([name, type]) => ({ name, type })) },
+  return { jobComplete: true, jobReference: { projectId: p, jobId: 'rows', location: 'US' }, schema: { fields: fields.map(([name, type]) => ({ name, type })) },
     rows: rows.length ? rows.map(r => ({ f: fields.map(([n]) => ({ v: r[n] === null ? null : String(r[n]) })) })) : undefined };
 }
 
@@ -243,7 +247,7 @@ function validateRow(table, row) {
 const vid = k => 'v' + String(k).padStart(10, '0');
 
 function fakeYouTube({ quotaOn = 0, failOn = [] } = {}) {
-  const yt = { searches: [], detailCalls: [] };
+  const yt = { searches: [], detailCalls: [], offset: 0 }; // raise offset to get brand-new videos
   yt.api = {
     Search: {
       list(part, args) {
@@ -252,9 +256,9 @@ function fakeYouTube({ quotaOn = 0, failOn = [] } = {}) {
         if (n === quotaOn) throw new Error('The request cannot be completed because you have exceeded your quota.');
         if (failOn.includes(n)) throw new Error('Backend Error');
         return { items: Array.from({ length: 50 }, (_, i) => {
-          const id = vid((n * 37 + i) % 1200);
+          const id = vid((n * 37 + i) % 1200 + yt.offset);
           return { id: { kind: 'youtube#video', videoId: id }, snippet: {
-            publishedAt: '2026-10-01T10:00:00Z', channelId: 'UC1', channelTitle: 'Prep &amp; Co',
+            publishedAt: (n * 37 + i) % 1200 % 9 === 0 ? '2019-05-01T10:00:00Z' : '2026-10-01T10:00:00Z', channelId: `UC${(n * 37 + i) % 1200 % 7}`, channelTitle: `Prep &amp; Co ${(n * 37 + i) % 1200 % 7}`,
             title: `Don&#39;t miss this ${id}`, description: 'desc', thumbnails: { high: { url: `https://i.ytimg.com/${id}.jpg` } } } };
         }) };
       },
@@ -266,7 +270,8 @@ function fakeYouTube({ quotaOn = 0, failOn = [] } = {}) {
         yt.detailCalls.push(ids);
         return { items: ids.filter(id => Number(id.slice(1)) % 13 !== 0).map(id => {
           const k = Number(id.slice(1));
-          return { id, contentDetails: { duration: k % 5 === 0 ? 'PT3M30S' : 'PT45S' },
+          return { id, snippet: k % 10 === 3 ? { defaultAudioLanguage: 'hi' } : k % 10 === 4 ? {} : { defaultAudioLanguage: 'en-US' },
+            contentDetails: { duration: k % 5 === 0 ? 'PT3M30S' : 'PT45S' },
             status: { embeddable: k % 11 !== 0 }, statistics: { viewCount: String(k * 10), likeCount: String(k) } };
         }) };
       },
@@ -365,7 +370,7 @@ test('manifest: advanced services, scopes and an anonymous web app', () => {
 test('onOpen adds the FocusFeed menu', () => {
   const env = load();
   env.run('onOpen()');
-  assert.deepEqual(env.ui.menu, ['setup', 'setGeminiApiKey', 'runCollect', 'runScore', 'runBuildFeed', 'openFeed', 'checkSetup']);
+  assert.deepEqual(env.ui.menu, ['setup', 'setGeminiApiKey', 'runCollect', 'runScore', 'runBuildFeed', 'runLoadEvents', 'openFeed', 'checkSetup']);
 });
 
 test('first Setup (sheets): asks for the topic, builds Settings + data tabs, removes empty Sheet1', () => {
@@ -406,15 +411,15 @@ test('Setup adds settings and columns missing from older versions', () => {
   env.run('setup()');
   const raw = env.book.getSheetByName('raw_videos');
   const lastCol = raw.getLastColumn();
-  raw.set(1, lastCol, ''); // pretend thumbnail_url didn't exist yet
+  raw.set(1, lastCol, ''); // pretend language didn't exist yet
   const settings = env.book.getSheetByName('Settings');
   const row = settings.rows().findIndex(r => r[0] === 'FEED_PAGE_SIZE') + 2;
   [1, 2, 3].forEach(c => settings.set(row, c, 'zz_old')); // a stale row stands in for the missing key
   env.run('setup()');
-  assert.equal(raw.header().at(-1), 'thumbnail_url');
+  assert.equal(raw.header().at(-1), 'language');
   assert.equal(env.setting('FEED_PAGE_SIZE'), 50);
   assert.match(env.lastAlert().msg, /New settings added: FEED_PAGE_SIZE/);
-  assert.match(env.lastAlert().msg, /Columns added: raw_videos \(\+thumbnail_url\)/);
+  assert.match(env.lastAlert().msg, /Columns added: raw_videos \(\+language\)/);
 });
 
 test('cancelling the topic prompt stops Setup without creating data tabs', () => {
@@ -656,7 +661,7 @@ test('collect (bigquery): 50 searches, unique rows batch-loaded into raw_videos,
   assert.equal(new Set(rows.map(r => r.video_id)).size, rows.length, 'one row per video per run');
   const r = rows.find(x => x.video_id === vid(38));
   assert.equal(r.title, `Don't miss this ${vid(38)}`);
-  assert.equal(r.channel_title, 'Prep & Co');
+  assert.equal(r.channel_title, `Prep & Co ${38 % 7}`);
   assert.equal(r.duration_sec, 45);
   assert.equal(r.view_count, 380);
   assert.equal(r.topic, 'TOEFL');
@@ -820,6 +825,7 @@ function scoreEnv({ storage = 'bigquery', gemini = {}, fallback } = {}) {
 }
 
 const feedEligible = rows => rows.filter(r => r.embeddable && r.duration_sec >= 1 && r.duration_sec <= 180);
+const pv = env => env.run('promptVersion_(readSettings_(getSpreadsheet_()))');
 
 test('Setup schedules the daily score an hour after collect', () => {
   const env = load({ prompts: ['TOEFL'] });
@@ -852,7 +858,7 @@ test('score (bigquery): every feed-eligible video scored once, in batches of 25,
     c.items.forEach(i => assert.ok(i.description.length <= 300 && i.title.length <= 200));
   });
   const v38 = scored.find(s => s.video_id === vid(38));
-  assert.deepEqual([v38.score, v38.model, v38.prompt_version, v38.topic], [38 % 11, 'gemini-test-flash-001', 'v1', 'TOEFL']);
+  assert.deepEqual([v38.score, v38.model, v38.prompt_version, v38.topic], [38 % 11, 'gemini-test-flash-001', pv(env), 'TOEFL']);
   const log = env.bq.rows.pipeline_runs.filter(r => r.step === 'score');
   assert.equal(log.length, 1);
   assert.deepEqual([log[0].status, log[0].rows_in, log[0].rows_out, log[0].quota_units], ['ok', eligible.length, eligible.length, env.gem.calls.length]);
@@ -957,7 +963,7 @@ test('score (sheets): reads the raw_videos tab, appends to scored_videos, skips 
   const raw = env.run('sheetsReadTable_(getSpreadsheet_(), "raw_videos")');
   const scored = env.run('sheetsReadTable_(getSpreadsheet_(), "scored_videos")');
   assert.equal(scored.length, feedEligible(raw).length);
-  assert.ok(scored.every(s => s.prompt_version === 'v1' && s.topic === 'TOEFL'));
+  assert.ok(scored.every(s => s.prompt_version === pv(env) && s.topic === 'TOEFL'));
   const calls = env.gem.calls.length;
   env.run('runScore()');
   assert.equal(env.gem.calls.length, calls);
@@ -1191,7 +1197,7 @@ test('feed: Build feed now works on its own, and uses the newest score per video
   const env = scoreEnv();
   env.run('runScore()');
   const v = env.bq.rows.feed[0].video_id;
-  env.bq.rows.scored_videos.push({ run_id: 'later', scored_at: '2099-01-01T00:00:00.000Z', topic: 'TOEFL', video_id: v, score: 2, reason: 'rescored low', model: 'm', prompt_version: 'v1' });
+  env.bq.rows.scored_videos.push({ run_id: 'later', scored_at: '2099-01-01T00:00:00.000Z', topic: 'TOEFL', video_id: v, score: 2, reason: 'rescored low', model: 'm', prompt_version: pv(env) });
   env.run('runBuildFeed()');
   assert.ok(!env.bq.rows.feed.some(x => x.video_id === v), 'a newer low score drops it');
   assert.match(env.lastAlert().msg, /✓ \d+ videos in the feed/);
@@ -1235,7 +1241,7 @@ test('getFeedPage (bigquery): 50 at a time, best first, skipping what this sessi
   assert.equal(p1.more, env.bq.rows.feed.length > 50);
   const scores = p1.videos.map(v => v.score);
   assert.deepEqual(scores, scores.slice().sort((a, b) => b - a), 'best first');
-  assert.deepEqual(Object.keys(p1.videos[0]).sort(), ['channel', 'id', 'liked', 'reason', 'score', 'seconds', 'title']);
+  assert.deepEqual(Object.keys(p1.videos[0]).sort(), ['boosted', 'channel', 'id', 'liked', 'reason', 'score', 'seconds', 'title']);
   const p2 = env.run(`getFeedPage({ seed: "abc", exclude: ${JSON.stringify(p1.videos.map(v => v.id))} })`);
   assert.ok(p2.videos.every(v => !p1.videos.some(x => x.id === v.id)), 'no repeats in a session');
 });
@@ -1266,6 +1272,7 @@ test('getFeedPage hides videos watched or skipped recently, unless includeSeen',
   env.run(`logEvents(${JSON.stringify(seen)})`);
   const after = env.run('getFeedPage({ seed: "s" })').videos.map(v => v.id);
   assert.ok(seen.every(e => !after.includes(e.video_id)));
+  env.setSetting('FEED_PAGE_SIZE', 200); // skips also lower their channel a little, so look past the top 50
   const again = env.run('getFeedPage({ seed: "s", includeSeen: true })').videos.map(v => v.id);
   assert.ok(seen.every(e => again.includes(e.video_id)));
 });
@@ -1343,4 +1350,201 @@ test('like/dislike: the latest signal wins regardless of the order rows were wri
     { video_id: '${id}', event_type: 'dislike', session_id: 'sess123456', at: '${t(5000)}' },
   ])`);
   assert.ok(env.run('getFeedPage({ seed: "s" })').videos.some(v => v.id === id), 'undislike was later');
+});
+
+/* ---------- Learn (step 5) ---------- */
+
+function signalsFor(env, events) {
+  const now = Date.now();
+  env.run(`logEvents(${JSON.stringify(events.map(([id, type], i) => ({ video_id: id, event_type: type, watch_ms: 9000, position: i, session_id: 'sess123456', at: new Date(now - (events.length - i) * 1000).toISOString() })))})`);
+}
+
+test('learn: liking a channel lifts its other videos; disliking one lowers them', () => {
+  const env = feedEnv();
+  env.setSetting('FEED_PAGE_SIZE', 200);
+  const feed = env.bq.rows.feed;
+  const chan = c => feed.filter(v => v.channel_title === c);
+  const channels = [...new Set(feed.map(v => v.channel_title))];
+  const [fav, meh] = channels;
+  const avgRank = (page, c) => { const idx = page.map((v, i) => (v.channel === c ? i : -1)).filter(i => i >= 0); return idx.reduce((a, b) => a + b, 0) / idx.length; };
+  const before = env.run('getFeedPage({ seed: "s" })').videos;
+  signalsFor(env, [[chan(fav)[0].video_id, 'like'], [chan(fav)[1].video_id, 'like'], [chan(meh)[0].video_id, 'dislike']]);
+  const after = env.run('getFeedPage({ seed: "s" })').videos;
+  assert.ok(avgRank(after, fav) < avgRank(before, fav), 'liked channel moves up');
+  assert.ok(avgRank(after, meh) > avgRank(before, meh), 'disliked channel moves down');
+  assert.ok(after.filter(v => v.channel === fav).every(v => v.boosted), 'marked as boosted');
+  assert.ok(after.filter(v => v.channel === meh).every(v => !v.boosted));
+  // relevance still leads: the boost is capped at ±2, so a 7 never beats a 10
+  const top = after[0];
+  assert.ok(top.score >= 9, 'the very best videos stay on top');
+});
+
+test('learn: channel affinity is capped at ±2 points', () => {
+  const env = load();
+  const rows = [1, 2, 3, 4, 5, 6].map(i => ({ video_id: vid(i), channel_title: 'A' })).concat([{ video_id: vid(9), channel_title: 'B' }]);
+  const sig = { liked: rows.slice(0, 6).map(r => r.video_id), disliked: [vid(9)], watches: {}, skips: {} };
+  sig.watches[vid(9)] = 10;
+  const aff = env.run(`channelAffinity_(${JSON.stringify(rows)}, ${JSON.stringify(sig)})`);
+  assert.deepEqual(aff, { A: 2, B: -0.6 });
+});
+
+test('learn: the scoring prompt carries the viewer’s likes and dislikes once there are any', () => {
+  const env = scoreEnv();
+  env.run('runScore()');
+  assert.doesNotMatch(env.gem.calls[0].body.systemInstruction.parts[0].text, /This learner also marked/);
+  const feed = env.bq.rows.feed;
+  signalsFor(env, [[feed[0].video_id, 'like'], [feed[1].video_id, 'dislike'], [feed[2].video_id, 'like'], [feed[2].video_id, 'unlike']]);
+  // new videos arrive and get scored
+  env.props[Object.keys(env.props).find(k => k.startsWith('YT_UNITS_'))] = '0';
+  env.yt.offset = 5000;
+  env.run('runCollect()');
+  const callsBefore = env.gem.calls.length;
+  env.run('runScore()');
+  assert.ok(env.gem.calls.length > callsBefore, 'new videos were scored');
+  const prompt = env.gem.calls[callsBefore].body.systemInstruction.parts[0].text;
+  assert.match(prompt, /This learner also marked videos in the app/);
+  assert.match(prompt, /never rate an off-topic video highly/);
+  const liked = JSON.parse(prompt.match(/Liked \(JSON\): (.*)/)[1]);
+  const disliked = JSON.parse(prompt.match(/Marked "not for me" \(JSON\): (.*)/)[1]);
+  assert.deepEqual(liked.map(x => x.title), [feed[0].title], 'unliked videos are not used');
+  assert.deepEqual(disliked.map(x => x.title), [feed[1].title]);
+  assert.match(env.lastAlert().msg, /Your likes shaped these scores \(1 liked, 1 disliked/);
+});
+
+test('learn: nightly load copies new events to BigQuery once and stamps them', () => {
+  const env = feedEnv();
+  const ids = env.bq.rows.feed.slice(0, 3).map(v => v.video_id);
+  signalsFor(env, [[ids[0], 'watch'], [ids[1], 'skip'], [ids[2], 'like']]);
+  env.run('runLoadEvents()');
+  const loaded = env.bq.rows.events;
+  assert.equal(loaded.length, 3);
+  assert.deepEqual(loaded.map(e => e.event_type), ['watch', 'skip', 'like']);
+  assert.ok(loaded.every(e => e.topic === 'TOEFL' && /^[0-9a-f-]{36}$/.test(e.event_id) && !isNaN(Date.parse(e.loaded_at))));
+  const tab = env.run('sheetsReadTable_(getSpreadsheet_(), "events")');
+  assert.ok(tab.every(r => r.loaded_at), 'stamped in the tab');
+  assert.match(env.lastAlert().msg, /✓ 3 new events loaded/);
+  env.run('runLoadEvents()');
+  assert.equal(env.bq.rows.events.length, 3, 'nothing loaded twice');
+  assert.match(env.lastAlert().msg, /No new events since the last load/);
+  signalsFor(env, [[ids[0], 'dislike']]);
+  env.run('runLoadEvents()');
+  assert.equal(env.bq.rows.events.length, 4, 'only the new one');
+  const log = env.bq.rows.pipeline_runs.filter(r => r.step === 'load_events');
+  assert.deepEqual(log.map(r => r.rows_out), [3, 0, 1]);
+  // the live feed still reads the tab, so the dislike still works after loading
+  assert.ok(!env.run('getFeedPage({ seed: "s" })').videos.some(v => v.id === ids[0]));
+});
+
+test('learn: Setup schedules the nightly load only with BigQuery storage', () => {
+  const bq = bigQueryEnv();
+  bq.run('setup()');
+  assert.equal(bq.triggers.filter(t => t.fn === 'runLoadEvents').length, 1);
+  assert.equal(bq.triggers.find(t => t.fn === 'runLoadEvents').atHour, 2);
+  assert.match(bq.lastAlert().msg, /Nightly events load scheduled daily around 2:00/);
+  const sheets = load({ prompts: ['TOEFL'] });
+  sheets.run('setup()');
+  assert.equal(sheets.triggers.filter(t => t.fn === 'runLoadEvents').length, 0);
+  sheets.run('runLoadEvents()');
+  assert.match(sheets.lastAlert().msg, /events tab is the events table/);
+});
+
+test('learn: checkSetup shows the nightly load', () => {
+  const env = feedEnv();
+  env.run('runLoadEvents()');
+  env.run('checkSetup()');
+  assert.match(env.lastAlert().msg, /✓ Nightly events load scheduled \(around 2:00\)/);
+  assert.match(env.lastAlert().msg, /✓ Last events load: .* UTC, ok, 0 events/);
+});
+
+/* ---------- content rules (age, language, ads, own guidance) ---------- */
+
+function rulesEnv({ storage = 'bigquery', settings = {} } = {}) {
+  let gem;
+  const opts = { fetch: (u, o) => gem.fetch(u, o) };
+  const env = storage === 'bigquery' ? bigQueryEnv(opts) : load(Object.assign({ prompts: ['TOEFL'] }, opts));
+  gem = fakeGemini({ env });
+  env.gem = gem;
+  env.run('setup()');
+  Object.entries(settings).forEach(([k, v]) => env.setSetting(k, v));
+  env.props.GEMINI_API_KEY = 'AIza-test';
+  env.run('runCollect()');
+  return env;
+}
+const year = id => Number(id.slice(1)) % 9 === 0 ? 2019 : 2026;
+const audio = id => (Number(id.slice(1)) % 10 === 3 ? 'hi' : Number(id.slice(1)) % 10 === 4 ? null : 'en-US');
+
+test('rules: the new settings appear with safe defaults and are validated', () => {
+  const env = load({ prompts: ['TOEFL'] });
+  env.run('setup()');
+  assert.deepEqual(['MAX_VIDEO_AGE_DAYS', 'LANGUAGE_FILTER', 'EXCLUDE_ADS', 'SCORING_GUIDANCE'].map(env.setting), [0, '', 'yes', '']);
+  env.setSetting('LANGUAGE_FILTER', 'english');
+  env.setSetting('SCORING_GUIDANCE', 'x'.repeat(2001));
+  env.run('setup()');
+  assert.match(env.lastAlert().msg, /LANGUAGE_FILTER "english" doesn't look right/);
+  assert.match(env.lastAlert().msg, /SCORING_GUIDANCE is longer than 2000 characters/);
+});
+
+test('rules: collect records the audio language and searches only recent videos', () => {
+  const env = rulesEnv({ settings: { MAX_VIDEO_AGE_DAYS: 730 } });
+  const after = Date.parse(env.yt.searches[0].publishedAfter);
+  assert.ok(Math.abs(after - (Date.now() - 730 * DAY)) < 60000, 'publishedAfter = now - 730 days');
+  const raw = env.bq.rows.raw_videos;
+  assert.equal(raw.find(r => audio(r.video_id) === 'hi').language, 'hi');
+  assert.equal(raw.find(r => audio(r.video_id) === null).language, null);
+});
+
+for (const storage of ['bigquery', 'sheets']) {
+  test(`rules (${storage}): old videos and other languages never get scored or shown`, () => {
+    const env = rulesEnv({ storage, settings: { MAX_VIDEO_AGE_DAYS: 730, LANGUAGE_FILTER: 'en' } });
+    env.run('runScore()');
+    const scoredIds = env.gem.calls.flatMap(c => c.items.map(i => vid(Number(i.title.match(/v(\d+)/)[1]))));
+    assert.ok(scoredIds.length > 0);
+    assert.ok(scoredIds.every(id => year(id) === 2026), 'no 2019 videos sent to Gemini');
+    assert.ok(scoredIds.every(id => audio(id) !== 'hi'), 'no Hindi-audio videos sent to Gemini');
+    assert.ok(scoredIds.some(id => audio(id) === null), 'unknown language is left to Gemini');
+    const feed = storage === 'bigquery' ? env.bq.rows.feed : env.run('sheetsReadTable_(getSpreadsheet_(), "feed")');
+    assert.ok(feed.length > 0 && feed.every(v => year(v.video_id) === 2026 && audio(v.video_id) !== 'hi'));
+  });
+}
+
+test('rules: language, no-ads and your guidance go into the scoring prompt', () => {
+  const guidance = 'Only the new TOEFL iBT format (from January 2026): Build a Sentence, Write an Email, Take an Interview.';
+  const env = rulesEnv({ settings: { LANGUAGE_FILTER: 'en', SCORING_GUIDANCE: guidance } });
+  env.run('runScore()');
+  const prompt = env.gem.calls[0].body.systemInstruction.parts[0].text;
+  assert.match(prompt, /The learner's rules\. Apply them strictly: a video that breaks any of them scores 2 or less\./);
+  assert.match(prompt, /- Only videos in English\./);
+  assert.match(prompt, /- No advertisements: a video that mainly promotes a paid course/);
+  assert.ok(prompt.includes(`- In the learner's own words: ${JSON.stringify(guidance)}`));
+  assert.match(pv(env), /^v1-[0-9a-z]{1,6}$/);
+});
+
+test('rules: with every rule off the prompt has no rules section and the version stays v1', () => {
+  const env = rulesEnv({ settings: { EXCLUDE_ADS: 'no' } });
+  env.run('runScore()');
+  assert.doesNotMatch(env.gem.calls[0].body.systemInstruction.parts[0].text, /learner's rules/);
+  assert.equal(pv(env), 'v1');
+});
+
+test('rules: changing the guidance re-scores every video once under the new version', () => {
+  const env = rulesEnv();
+  env.run('runScore()');
+  const first = env.bq.rows.scored_videos.length;
+  const v1 = pv(env);
+  env.setSetting('SCORING_GUIDANCE', 'Only the new TOEFL format.');
+  env.run('runScore()');
+  const v2 = pv(env);
+  assert.notEqual(v1, v2);
+  const rescored = env.bq.rows.scored_videos.filter(s => s.prompt_version === v2);
+  assert.equal(rescored.length, first, 'every video scored again');
+  assert.match(env.lastAlert().msg, new RegExp(`new scoring rules \\(version ${v2}\\): every video is re-scored once`));
+  assert.ok(env.bq.rows.feed.length > 0);
+  env.run('runScore()');
+  assert.match(env.lastAlert().msg, /Nothing new to score/);
+});
+
+test('rules: checkSetup lists the content rules', () => {
+  const env = rulesEnv({ settings: { LANGUAGE_FILTER: 'en', MAX_VIDEO_AGE_DAYS: 730, SCORING_GUIDANCE: 'New format only.' } });
+  env.run('checkSetup()');
+  assert.match(env.lastAlert().msg, /Content rules: English only · no ads · published in the last 730 days · your own guidance \(scoring version v1-[0-9a-z]+\)/);
 });
