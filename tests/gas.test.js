@@ -722,15 +722,17 @@ test('checkSetup shows the schedule, last collect and units used today', () => {
  * can misbehave on chosen calls: { 3: '429', 4: 'daily', 5: '500', 6: 'garbage', 7: 'skip' }.
  * `clock` advances a fake Date.now by the given ms per call (for time-limit tests).
  */
-function fakeGemini({ on = {}, clock = 0, env } = {}) {
+function fakeGemini({ on = {}, models = {}, clock = 0, env } = {}) {
   const gem = { calls: [] };
   gem.fetch = (url, opts) => {
-    if (!/:generateContent$/.test(url)) return { code: 200, body: '{}' }; // key check
+    const model = decodeURIComponent(url.match(/models\/([^:?]+)/)[1]);
+    if (!/:generateContent$/.test(url)) return models[model] === 'missing' ? { code: 404, body: '{"error":{"message":"not found"}}' } : { code: 200, body: '{}' }; // key/model check
     const body = JSON.parse(opts.payload);
     const items = JSON.parse(body.contents[0].parts[0].text);
-    gem.calls.push({ url, opts, body, items });
+    gem.calls.push({ url, opts, body, items, model });
     if (clock && env) env.run(`__now += ${clock}`);
-    const mode = on[gem.calls.length];
+    const mode = on[gem.calls.length] || { busy: '500', daily: 'daily', missing: 'missing' }[models[model]];
+    if (mode === 'missing') return { code: 404, body: JSON.stringify({ error: { code: 404, message: `models/${model} is not found` } }) };
     const err = (code, message, details) => ({ code, body: JSON.stringify({ error: { code, message, details } }) });
     if (mode === '429') { delete on[gem.calls.length]; return err(429, 'Resource exhausted', [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '7s' }]); }
     if (mode === 'daily') return err(429, 'Quota exceeded: requests per day', [{ '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }] }]);
@@ -739,18 +741,20 @@ function fakeGemini({ on = {}, clock = 0, env } = {}) {
     let answer = items.map(it => ({ id: it.id, score: Number(it.title.match(/v(\d+)/)[1]) % 11, reason: `about ${it.title.slice(-4)}` }));
     if (mode === 'skip') { answer = answer.slice(1); answer[0].score = 99; answer.push({ id: '3', score: 0, reason: 'dup' }); } // drop id 1, id 2 out of range, duplicate id 3
     const text = mode === 'garbage' ? 'Sure! Here are the scores:' : JSON.stringify(answer);
-    return { code: 200, body: JSON.stringify({ candidates: [{ content: { parts: [{ text }] }, finishReason: 'STOP' }], modelVersion: 'gemini-test-flash-001' }) };
+    const modelVersion = model === 'gemini-flash-latest' ? 'gemini-test-flash-001' : `${model}-001`;
+    return { code: 200, body: JSON.stringify({ candidates: [{ content: { parts: [{ text }] }, finishReason: 'STOP' }], modelVersion }) };
   };
   return gem;
 }
 
-function scoreEnv({ storage = 'bigquery', gemini = {} } = {}) {
+function scoreEnv({ storage = 'bigquery', gemini = {}, fallback } = {}) {
   let gem;
   const opts = { fetch: (u, o) => gem.fetch(u, o) };
   const env = storage === 'bigquery' ? bigQueryEnv(opts) : load(Object.assign({ prompts: ['TOEFL'] }, opts));
   gem = fakeGemini(Object.assign({ env }, gemini));
   env.gem = gem;
   env.run('setup()');
+  if (fallback !== undefined) env.setSetting('GEMINI_FALLBACK_MODELS', fallback);
   env.props.GEMINI_API_KEY = 'AIza-test';
   env.run('runCollect()');
   return env;
@@ -834,7 +838,7 @@ test('score: a 429 is retried after Gemini\'s retryDelay', () => {
 });
 
 test('score: daily Gemini quota stops cleanly, keeps earlier batches, no continuation', () => {
-  const env = scoreEnv({ gemini: { on: { 3: 'daily' } } });
+  const env = scoreEnv({ gemini: { on: { 3: 'daily' } }, fallback: 'none' });
   env.run('runScore()');
   assert.equal(env.gem.calls.length, 3);
   assert.equal(env.bq.rows.scored_videos.length, 50, 'first two batches saved');
@@ -845,7 +849,7 @@ test('score: daily Gemini quota stops cleanly, keeps earlier batches, no continu
 });
 
 test('score: an overloaded model stops for now and continues a minute later', () => {
-  const env = scoreEnv({ gemini: { on: { 2: '500', 3: '500', 4: '500', 5: '500' } } });
+  const env = scoreEnv({ gemini: { on: { 2: '500', 3: '500', 4: '500', 5: '500' } }, fallback: 'none' });
   env.run('runScore()');
   assert.equal(env.bq.rows.scored_videos.length, 25);
   assert.match(env.lastAlert().msg, /Gemini is busy \(The model is overloaded\)/);
@@ -926,7 +930,7 @@ test('score: a hard failure mid-run still saves the batches scored before it', (
 });
 
 test('score: Gemini overloaded from the start retries by itself every 10 minutes, 3 times at most', () => {
-  const env = scoreEnv();
+  const env = scoreEnv({ fallback: 'none' });
   const realFetch = env.gem.fetch;
   let busy = true;
   env.gem.fetch = (url, opts) => (busy && /:generateContent$/.test(url)
@@ -951,4 +955,102 @@ test('score: Gemini overloaded from the start retries by itself every 10 minutes
   env.run('runScore()');
   assert.equal(env.bq.rows.scored_videos.length, feedEligible(env.bq.rows.raw_videos).length);
   assert.equal(env.props.SCORE_IDLE_RETRIES, undefined);
+});
+
+test('score: saves every 2 batches, so a run cut off by Apps Script loses at most one chunk', () => {
+  const env = scoreEnv();
+  const savedAtCall = [];
+  const inner = env.gem.fetch;
+  env.gem.fetch = (url, opts) => {
+    if (/:generateContent$/.test(url)) savedAtCall.push((env.bq.rows.scored_videos || []).length);
+    return inner(url, opts);
+  };
+  env.run('runScore()');
+  assert.deepEqual(savedAtCall.slice(0, 6), [0, 0, 50, 50, 100, 100], 'already in BigQuery before each call');
+  const loads = Object.keys(env.bq.jobs).filter(id => id.startsWith('focusfeed_scored_videos_'));
+  assert.equal(loads.length, Math.ceil(env.gem.calls.length / 2));
+  assert.equal(new Set(loads).size, loads.length, 'unique job IDs per chunk');
+  const log = env.bq.rows.pipeline_runs.find(r => r.step === 'score');
+  assert.equal(log.rows_out, env.bq.rows.scored_videos.length);
+});
+
+test('score: thinking is switched off, and dropped once for a model that rejects the setting', () => {
+  const env = scoreEnv();
+  const inner = env.gem.fetch;
+  let rejected = 0;
+  env.gem.fetch = (url, opts) => {
+    if (/:generateContent$/.test(url) && JSON.parse(opts.payload).generationConfig.thinkingConfig) {
+      rejected++;
+      return { code: 400, body: JSON.stringify({ error: { code: 400, message: 'Thinking budget is not supported for this model.' } }) };
+    }
+    return inner(url, opts);
+  };
+  env.run('runScore()');
+  assert.equal(rejected, 1, 'rejected once, then remembered');
+  assert.equal(env.props['GEMINI_NO_THINKING_CONFIG_gemini-flash-latest'], '1');
+  assert.equal(env.bq.rows.scored_videos.length, feedEligible(env.bq.rows.raw_videos).length);
+});
+
+test('score: requests ask for no thinking by default', () => {
+  const env = scoreEnv();
+  env.run('runScore()');
+  assert.deepEqual(env.gem.calls[0].body.generationConfig.thinkingConfig, { thinkingBudget: 0 });
+});
+
+/* ---------- model fallback ---------- */
+
+test('fallback: an overloaded main model hands over to the next one for the rest of the run', () => {
+  const env = scoreEnv({ gemini: { models: { 'gemini-flash-latest': 'busy' } } });
+  env.run('runScore()');
+  const primary = env.gem.calls.filter(c => c.model === 'gemini-flash-latest');
+  assert.equal(primary.length, 2, 'two quick tries on the main model, not four');
+  assert.ok(env.gem.calls.slice(2).every(c => c.model === 'gemini-flash-lite-latest'), 'never goes back to the busy model');
+  const scored = env.bq.rows.scored_videos;
+  assert.equal(scored.length, feedEligible(env.bq.rows.raw_videos).length, 'nothing lost: the failed batch was redone');
+  assert.ok(scored.every(s => s.model === 'gemini-flash-lite-latest-001'));
+  const msg = env.lastAlert().msg;
+  assert.match(msg, /gemini-flash-latest overloaded; switched to gemini-flash-lite-latest/);
+  assert.match(msg, /Gemini calls \(gemini-flash-lite-latest-001\)/);
+  assert.equal(env.bq.rows.pipeline_runs.find(r => r.step === 'score').rows_in, scored.length);
+});
+
+test('fallback: daily quota on one model and a missing model are both skipped', () => {
+  const env = scoreEnv({ gemini: { on: { 4: 'daily' }, models: { 'gemini-flash-lite-latest': 'missing' } } });
+  env.run('runScore()');
+  const msg = env.lastAlert().msg;
+  assert.match(msg, /gemini-flash-latest out of daily quota; switched to gemini-flash-lite-latest/);
+  assert.match(msg, /gemini-flash-lite-latest not found; switched to gemini-2\.5-flash/);
+  assert.match(msg, /\(gemini-test-flash-001, gemini-2\.5-flash-001\)/);
+  assert.equal(env.bq.rows.scored_videos.length, feedEligible(env.bq.rows.raw_videos).length);
+});
+
+test('fallback: when every model is busy it stops and retries later', () => {
+  const busy = { 'gemini-flash-latest': 'busy', 'gemini-flash-lite-latest': 'busy', 'gemini-2.5-flash': 'busy' };
+  const env = scoreEnv({ gemini: { models: busy } });
+  env.run('runScore()');
+  assert.deepEqual(env.gem.calls.map(c => c.model), ['gemini-flash-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-flash-lite-latest',
+    'gemini-2.5-flash', 'gemini-2.5-flash', 'gemini-2.5-flash', 'gemini-2.5-flash'], 'last model gets the full 4 tries');
+  assert.equal(env.triggers.filter(t => t.fn === 'continueScore').length, 1);
+  assert.match(env.lastAlert().msg, /Nothing scored yet/);
+});
+
+test('fallback: every model out of daily quota stops without a continuation', () => {
+  const daily = { 'gemini-flash-latest': 'daily', 'gemini-flash-lite-latest': 'daily', 'gemini-2.5-flash': 'daily' };
+  const env = scoreEnv({ gemini: { models: daily } });
+  env.run('runScore()');
+  assert.equal(env.gem.calls.length, 3);
+  assert.equal(env.triggers.filter(t => t.fn === 'continueScore').length, 0);
+});
+
+test('fallback: a main model that does not exist, with fallback off, explains what to fix', () => {
+  const env = scoreEnv({ gemini: { models: { 'gemini-flash-latest': 'missing' } }, fallback: 'none' });
+  env.run('runScore()');
+  assert.equal(env.lastAlert().title, 'Score failed');
+  assert.match(env.lastAlert().msg, /model "gemini-flash-latest" was not found\. Fix GEMINI_MODEL/);
+});
+
+test('checkSetup lists which fallback models work', () => {
+  const env = scoreEnv({ gemini: { models: { 'gemini-2.5-flash': 'missing' } } });
+  env.run('checkSetup()');
+  assert.match(env.lastAlert().msg, /Fallback models: gemini-flash-lite-latest ✓ · gemini-2\.5-flash ✗ not found/);
 });

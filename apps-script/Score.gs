@@ -12,6 +12,11 @@
 const SCORE_PROMPT_VERSION = 'v1';
 const SHORTS_MAX_SEC = 180;
 const SCORE_CANDIDATE_LIMIT = 2000;
+// Apps Script kills a run at 6 minutes, and one Gemini call (with retries) can take a minute
+// or more. So: no new batch after 3 minutes, no retries after 4, and save every 2 batches.
+const SCORE_START_BATCHES_MS = 3 * 60 * 1000;
+const SCORE_RETRY_UNTIL_MS = 4 * 60 * 1000;
+const SCORE_SAVE_EVERY_ROWS = 50;
 const SCORE_SCHEMA = {
   type: 'ARRAY',
   items: {
@@ -80,42 +85,73 @@ function score_() {
   };
   const stats = { total: 0, calls: 0, model: null, notes: [], stopped: null, titles: {}, rows: [] };
   let failure = null;
+  let unsaved = [];
+  let saves = 0;
+  // Saves in small chunks, so a run cut off by Apps Script loses at most one chunk.
+  const save = () => {
+    if (!unsaved.length) return;
+    run.rows_out += storeAppend_(cfg, 'scored_videos', unsaved, `${run.run_id}_${++saves}`);
+    unsaved = [];
+  };
+  const keep = rows => {
+    stats.rows = stats.rows.concat(rows);
+    unsaved = unsaved.concat(rows);
+    if (unsaved.length >= SCORE_SAVE_EVERY_ROWS) save();
+  };
+  // Main model first, then the fallbacks. A model that fails is skipped for the rest of the run.
+  const models = [cfg.GEMINI_MODEL].concat(cfg.GEMINI_FALLBACK_MODELS)
+    .filter((m, i, all) => m && m.toLowerCase() !== 'none' && all.indexOf(m) === i);
+  let current = 0;
+  stats.modelsUsed = [];
   try {
     const cands = scoreCandidates_(cfg);
     stats.total = cands.total;
     cands.rows.forEach(v => { stats.titles[v.video_id] = v.title; });
-    const deadline = started.getTime() + STEP_TIME_BUDGET_MS;
+    const stopStarting = started.getTime() + SCORE_START_BATCHES_MS;
+    const deadline = started.getTime() + SCORE_RETRY_UNTIL_MS;
     for (let i = 0; i < cands.rows.length; i += cfg.SCORE_BATCH_SIZE) {
-      if (Date.now() > deadline) { stats.notes.push('stopped early: time limit'); break; }
+      if (Date.now() > stopStarting) { stats.notes.push('paused to stay inside the Apps Script time limit'); break; }
       const batch = cands.rows.slice(i, i + cfg.SCORE_BATCH_SIZE);
       run.rows_in += batch.length;
       try {
-        const res = scoreBatch_(cfg, run, batch, deadline);
+        const lastModel = current === models.length - 1;
+        const res = scoreBatch_(cfg, run, batch, deadline, models[current], lastModel ? 4 : 2);
         stats.calls++;
         run.quota_units++;
         stats.model = res.model;
-        stats.rows = stats.rows.concat(res.rows);
+        if (stats.modelsUsed.indexOf(res.model) === -1) stats.modelsUsed.push(res.model);
+        keep(res.rows);
       } catch (e) {
+        const switchable = ['server', 'rate_limit', 'daily_quota', 'not_found'].indexOf(e.kind) !== -1;
+        if (switchable && current < models.length - 1) {
+          const why = { server: 'overloaded', rate_limit: 'rate-limited', daily_quota: 'out of daily quota', not_found: 'not found' }[e.kind];
+          stats.notes.push(`${models[current]} ${why}; switched to ${models[current + 1]}`);
+          current++;
+          run.rows_in -= batch.length;
+          i -= cfg.SCORE_BATCH_SIZE; // same batch again with the next model
+          continue;
+        }
         if (e.kind === 'output') {
           // Unusable answer for this batch: record it so these videos aren't retried forever.
           stats.calls++;
           run.quota_units++;
-          stats.rows = stats.rows.concat(batch.map(v => scoreRow_(cfg, run, v.video_id, null, 'no usable score: ' + e.message, cfg.GEMINI_MODEL)));
+          keep(batch.map(v => scoreRow_(cfg, run, v.video_id, null, 'no usable score: ' + e.message, cfg.GEMINI_MODEL)));
           stats.notes.push(`one batch got no usable answer (${e.message})`);
           continue;
         }
         run.rows_in -= batch.length;
         if (e.kind === 'daily_quota') { stats.stopped = 'quota'; stats.notes.push('Gemini daily quota used up; the rest is scored on the next run'); break; }
         if (e.kind === 'rate_limit' || e.kind === 'server') { stats.stopped = 'busy'; stats.notes.push(`Gemini is busy (${e.message}); stopping for now`); break; }
-        throw e; // bad key, bad model, bad request: nothing later will work either
+        if (e.kind === 'not_found') throw new Error(`Gemini model "${models[current]}" was not found. Fix GEMINI_MODEL / GEMINI_FALLBACK_MODELS in Settings.`);
+        throw e; // bad key or bad request: nothing later will work either
       }
     }
   } catch (e) {
     failure = e;
   }
-  // Save whatever was scored, even if the run failed part-way.
+  // Save the rest, even if the run failed part-way.
   try {
-    run.rows_out = storeAppend_(cfg, 'scored_videos', stats.rows, run.run_id);
+    save();
   } catch (e) {
     failure = failure || e;
   }
@@ -208,7 +244,7 @@ LIMIT @max_rows`;
 }
 
 /** One Gemini call for up to SCORE_BATCH_SIZE videos. Short numeric IDs keep the model from mangling YouTube IDs. */
-function scoreBatch_(cfg, run, batch, deadline) {
+function scoreBatch_(cfg, run, batch, deadline, model, maxAttempts) {
   const cut = (s, n) => String(s || '').slice(0, n);
   const items = batch.map((v, i) => ({
     id: String(i + 1),
@@ -218,24 +254,26 @@ function scoreBatch_(cfg, run, batch, deadline) {
     seconds: v.duration_sec,
   }));
   const res = geminiJson_({
-    model: cfg.GEMINI_MODEL,
+    model,
+    maxAttempts,
     system: scoringPrompt_(cfg.TOPIC),
     user: JSON.stringify(items),
     schema: SCORE_SCHEMA,
     deadline,
+    noThinking: true,
   });
   if (!Array.isArray(res.data)) throw geminiError_('output', 'expected a JSON list');
   const byId = {};
   res.data.forEach(x => { if (x && x.id !== undefined && !byId[String(x.id)]) byId[String(x.id)] = x; });
-  const model = res.modelVersion || cfg.GEMINI_MODEL;
+  const usedModel = res.modelVersion || model;
   const rows = batch.map((v, i) => {
     const x = byId[String(i + 1)];
     const s = x ? Math.round(Number(x.score)) : NaN;
     return Number.isFinite(s) && s >= 0 && s <= 10
-      ? scoreRow_(cfg, run, v.video_id, s, cut(x.reason, 200), model)
-      : scoreRow_(cfg, run, v.video_id, null, 'model skipped this video', model);
+      ? scoreRow_(cfg, run, v.video_id, s, cut(x.reason, 200), usedModel)
+      : scoreRow_(cfg, run, v.video_id, null, 'model skipped this video', usedModel);
   });
-  return { rows, model };
+  return { rows, model: usedModel };
 }
 
 function scoreRow_(cfg, run, videoId, score, reason, model) {
@@ -265,7 +303,7 @@ function scoreSummary_(r) {
   const band = (lo, hi) => scored.filter(x => x.score >= lo && x.score <= hi).length;
   const where = r.storage === 'bigquery' ? 'BigQuery scored_videos' : 'the scored_videos tab';
   const lines = [
-    `✓ Scored ${n(scored.length)} videos in ${r.calls} Gemini calls (${r.model || 'Gemini'})`,
+    `✓ Scored ${n(scored.length)} videos in ${r.calls} Gemini calls (${r.modelsUsed.length ? r.modelsUsed.join(', ') : 'Gemini'})`,
     `✓ ${n(scored.filter(x => x.score >= r.minScore).length)} scored ${r.minScore} or more (MIN_SCORE): these can reach the feed`,
     `Spread: 0–3: ${n(band(0, 3))} · 4–6: ${n(band(4, 6))} · 7–8: ${n(band(7, 8))} · 9–10: ${n(band(9, 10))}`,
     `✓ ${n(r.run.rows_out)} rows written to ${where}`,

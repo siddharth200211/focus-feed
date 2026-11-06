@@ -23,7 +23,7 @@ flowchart LR
 | Step | What happens | Runs |
 |---|---|---|
 | 1. Collect | Searches YouTube for your topic (short, embeddable videos; the day's searches rotate through topic phrasings and sort orders) and fetches each video's duration, embeddability and stats. Stops early rather than exceed the daily quota | Daily trigger |
-| 2. Score | Gemini rates each new feed-eligible video (embeddable, ≤ 3 min) 0–10 for how useful it is for learning the topic, 25 per call, with a one-line reason. Each video is scored once per prompt version; rate limits are retried, and a run that runs out of time continues itself a minute later | An hour after collect |
+| 2. Score | Gemini rates each new feed-eligible video (embeddable, ≤ 3 min) 0–10 for how useful it is for learning the topic, 25 per call, with a one-line reason. Each video is scored once per prompt version. If a model is overloaded or out of quota it switches to the next model in `GEMINI_FALLBACK_MODELS`; scores are saved every 2 batches, and a run near Apps Script's 6-minute limit pauses and continues itself a minute later | An hour after collect |
 | 3. Store | `raw_videos` → `scored_videos` → `feed`, plus `pipeline_runs` for monitoring | Each run |
 | 4. Show | Swipe UI with embedded players. Opens on a phone with no login | On demand |
 | 5. Learn | Watches and skips land in the `events` tab and get batch-loaded nightly | Nightly |
@@ -69,6 +69,7 @@ Everything is configured in the **Settings** tab. Setup adds any new settings wi
 | `MIN_SCORE` | `7` | Lowest Gemini score (0–10) that reaches the feed |
 | `SCORE_BATCH_SIZE` | `25` | Videos per Gemini call |
 | `GEMINI_MODEL` | `gemini-flash-latest` | An alias for the newest Flash model. Put a specific model name here to pin one |
+| `GEMINI_FALLBACK_MODELS` | `gemini-flash-lite-latest, gemini-2.5-flash` | Tried in order when the main model is overloaded, rate-limited, out of daily quota or not found. `none` turns fallback off |
 | `FEED_PAGE_SIZE` | `50` | Videos the web app loads at a time |
 | `STORAGE` | `sheets` | `sheets` or `bigquery` |
 | `LITE_MAX_ROWS` | `100000` | Sheets mode only: row cap per data tab |

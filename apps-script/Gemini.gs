@@ -9,7 +9,8 @@ const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/';
 
 /**
  * Calls generateContent with a JSON response schema. Returns { data, modelVersion }.
- * Throws an Error with .kind = 'daily_quota' | 'rate_limit' | 'server' | 'request' | 'output'.
+ * Throws an Error with .kind = 'daily_quota' | 'rate_limit' | 'server' | 'not_found' | 'request' | 'output'.
+ * opts.maxAttempts (default 4) — use fewer when another model can take over.
  */
 function geminiJson_(opts) {
   const key = PropertiesService.getScriptProperties().getProperty(GEMINI_KEY_PROP);
@@ -19,6 +20,13 @@ function geminiJson_(opts) {
     contents: [{ role: 'user', parts: [{ text: opts.user }] }],
     generationConfig: { temperature: 0, responseMimeType: 'application/json', responseSchema: opts.schema },
   };
+  // Scoring is a quick classification: switch "thinking" off so each call returns in seconds.
+  // Models that reject this setting get it dropped once, and the choice is remembered.
+  const props = PropertiesService.getScriptProperties();
+  const thinkingKey = 'GEMINI_NO_THINKING_CONFIG_' + opts.model;
+  if (opts.noThinking && !props.getProperty(thinkingKey)) {
+    body.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  }
   const deadline = opts.deadline || Date.now() + 60 * 1000;
   for (let attempt = 1; ; attempt++) {
     const res = UrlFetchApp.fetch(GEMINI_URL + encodeURIComponent(opts.model) + ':generateContent', {
@@ -35,11 +43,18 @@ function geminiJson_(opts) {
     let err = {};
     try { err = JSON.parse(text).error || {}; } catch (e) { /* not JSON */ }
     const message = err.message || `HTTP ${code}`;
+    if (code === 400 && body.generationConfig.thinkingConfig && /thinking/i.test(message)) {
+      delete body.generationConfig.thinkingConfig;
+      props.setProperty(thinkingKey, '1');
+      attempt--; // not a real failure: send again without the setting
+      continue;
+    }
     if (code === 429 && isDailyQuota_(err)) throw geminiError_('daily_quota', message);
+    if (code === 404) throw geminiError_('not_found', message);
     const retryable = code === 429 || code >= 500;
     if (!retryable) throw geminiError_('request', message);
     const waitMs = code === 429 ? retryDelayMs_(err, 20000) : 5000 * Math.pow(2, attempt - 1); // 5, 10, 20 s
-    if (attempt >= 4 || Date.now() + waitMs > deadline) {
+    if (attempt >= (opts.maxAttempts || 4) || Date.now() + waitMs > deadline) {
       throw geminiError_(code === 429 ? 'rate_limit' : 'server', message);
     }
     Utilities.sleep(waitMs);

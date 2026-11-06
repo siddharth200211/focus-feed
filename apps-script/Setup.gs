@@ -202,10 +202,17 @@ function checkSetup() {
   if (!key) {
     out.push('✗ Gemini key not set — FocusFeed → Set Gemini API key…');
   } else {
-    const model = (cfg && cfg.GEMINI_MODEL) || 'gemini-flash-latest';
-    const check = checkGeminiKey_(key, model);
-    out.push(!check.ok ? '✗ Gemini key rejected: ' + check.message
-      : check.modelOk ? `✓ Gemini key works (model ${model})` : '⚠ ' + check.message);
+    const primary = (cfg && cfg.GEMINI_MODEL) || 'gemini-flash-latest';
+    const check = checkGeminiKey_(key, primary);
+    if (!check.ok) {
+      out.push('✗ Gemini key rejected: ' + check.message);
+    } else {
+      out.push(check.modelOk ? `✓ Gemini key works (model ${primary})` : '⚠ ' + check.message);
+      const fallbacks = ((cfg && cfg.GEMINI_FALLBACK_MODELS) || []).filter(m => m.toLowerCase() !== 'none' && m !== primary);
+      if (fallbacks.length) {
+        out.push('Fallback models: ' + fallbacks.map(m => `${m} ${checkGeminiKey_(key, m).modelOk ? '✓' : '✗ not found'}`).join(' · '));
+      }
+    }
   }
   tell_('FocusFeed check', out);
 }
