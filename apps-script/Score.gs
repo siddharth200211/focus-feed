@@ -127,12 +127,37 @@ function score_() {
   if (failure) throw failure;
 
   stats.left = Math.max(0, stats.total - stats.rows.length);
-  stats.continuing = stats.left > 0 && stats.rows.length > 0 && stats.stopped !== 'quota';
-  if (stats.continuing) {
-    deleteTriggersFor_('continueScore');
-    ScriptApp.newTrigger('continueScore').timeBased().after(60 * 1000).create();
-  }
+  scheduleScoreContinuation_(stats);
   return Object.assign(stats, { run, storage: cfg.STORAGE, minScore: cfg.MIN_SCORE });
+}
+
+/**
+ * Videos left over? Continue in a minute if this run made progress. If Gemini was overloaded
+ * and nothing got scored, try again in 10 minutes, at most SCORE_IDLE_RETRY_MAX times in a
+ * row (after that the daily run picks them up). A used-up daily quota never continues.
+ */
+const SCORE_IDLE_RETRY_MAX = 3;
+function scheduleScoreContinuation_(stats) {
+  const props = PropertiesService.getScriptProperties();
+  const progress = stats.rows.length > 0;
+  let minutes = 0;
+  if (progress || !stats.left) props.deleteProperty('SCORE_IDLE_RETRIES');
+  if (stats.left && stats.stopped !== 'quota') {
+    if (progress) {
+      minutes = 1;
+    } else if (stats.stopped === 'busy') {
+      const tries = Number(props.getProperty('SCORE_IDLE_RETRIES')) || 0;
+      if (tries < SCORE_IDLE_RETRY_MAX) {
+        props.setProperty('SCORE_IDLE_RETRIES', String(tries + 1));
+        stats.retryAttempt = tries + 1;
+        minutes = 10;
+      }
+    }
+  }
+  stats.continuing = minutes > 0;
+  stats.continueInMin = minutes;
+  deleteTriggersFor_('continueScore');
+  if (minutes) ScriptApp.newTrigger('continueScore').timeBased().after(minutes * 60 * 1000).create();
 }
 
 /** Candidates: newest first, at most SCORE_CANDIDATE_LIMIT, plus how many exist in total. */
@@ -229,6 +254,13 @@ function scoreRow_(cfg, run, videoId, score, reason, model) {
 function scoreSummary_(r) {
   const n = x => Number(x).toLocaleString('en-US');
   if (!r.total) return ['Nothing new to score. Run collect first, or wait for the next daily run.'];
+  if (!r.rows.length) {
+    const lines = [`Nothing scored yet: ${n(r.total)} videos are waiting.`];
+    if (r.continuing) lines.push(`FocusFeed will try again by itself in ${r.continueInMin} minutes (attempt ${r.retryAttempt} of ${SCORE_IDLE_RETRY_MAX}). You can close this.`);
+    else lines.push('Try FocusFeed → Run score now later; the daily score run will also pick them up.');
+    if (r.notes.length) lines.push('', '⚠ ' + r.notes.join('\n⚠ '));
+    return lines.concat([`Run ID: ${r.run.run_id}`]);
+  }
   const scored = r.rows.filter(x => x.score !== null);
   const band = (lo, hi) => scored.filter(x => x.score >= lo && x.score <= hi).length;
   const where = r.storage === 'bigquery' ? 'BigQuery scored_videos' : 'the scored_videos tab';
@@ -244,7 +276,7 @@ function scoreSummary_(r) {
   if (sorted.length > 1) lines.push('Lowest: ' + show(sorted[sorted.length - 1]));
   const skipped = r.rows.length - scored.length;
   if (skipped) lines.push(`(${skipped} videos got no usable score and won't be retried)`);
-  if (r.left) lines.push('', r.continuing ? `${n(r.left)} left: continuing automatically in about a minute.` : `${n(r.left)} left for the next run.`);
+  if (r.left) lines.push('', r.continuing ? `${n(r.left)} left: continuing automatically in about ${r.continueInMin === 1 ? 'a minute' : r.continueInMin + ' minutes'}.` : `${n(r.left)} left for the next run.`);
   if (r.notes.length) lines.push('⚠ ' + r.notes.join('\n⚠ '));
   lines.push(`Run ID: ${r.run.run_id}`);
   return lines;

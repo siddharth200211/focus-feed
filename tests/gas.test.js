@@ -924,3 +924,31 @@ test('score: a hard failure mid-run still saves the batches scored before it', (
   const log = env.bq.rows.pipeline_runs.find(r => r.step === 'score');
   assert.deepEqual([log.status, log.rows_out], ['error', 50]);
 });
+
+test('score: Gemini overloaded from the start retries by itself every 10 minutes, 3 times at most', () => {
+  const env = scoreEnv();
+  const realFetch = env.gem.fetch;
+  let busy = true;
+  env.gem.fetch = (url, opts) => (busy && /:generateContent$/.test(url)
+    ? (env.gem.calls.push({}), { code: 503, body: JSON.stringify({ error: { code: 503, message: 'This model is currently experiencing high demand.' } }) })
+    : realFetch(url, opts));
+  env.run('runScore()');
+  assert.deepEqual(env.sleeps.filter(ms => ms >= 5000), [5000, 10000, 20000], 'backs off 5 s, 10 s, 20 s');
+  assert.equal(env.bq.rows.scored_videos, undefined);
+  let cont = env.triggers.filter(t => t.fn === 'continueScore');
+  assert.equal(cont.length, 1);
+  assert.equal(cont[0].after, 10 * 60 * 1000);
+  assert.match(env.lastAlert().msg, /Nothing scored yet: [\d,]+ videos are waiting/);
+  assert.match(env.lastAlert().msg, /try again by itself in 10 minutes \(attempt 1 of 3\)/);
+  env.run('continueScore()');
+  env.run('continueScore()');
+  assert.match(env.lastAlert().msg, /attempt 3 of 3/);
+  env.run('continueScore()');
+  assert.equal(env.triggers.filter(t => t.fn === 'continueScore').length, 0, 'gives up after 3 idle retries');
+  assert.match(env.lastAlert().msg, /Try FocusFeed → Run score now later/);
+
+  busy = false; // Gemini recovers: a run makes progress and the retry counter resets
+  env.run('runScore()');
+  assert.equal(env.bq.rows.scored_videos.length, feedEligible(env.bq.rows.raw_videos).length);
+  assert.equal(env.props.SCORE_IDLE_RETRIES, undefined);
+});

@@ -38,7 +38,7 @@ function geminiJson_(opts) {
     if (code === 429 && isDailyQuota_(err)) throw geminiError_('daily_quota', message);
     const retryable = code === 429 || code >= 500;
     if (!retryable) throw geminiError_('request', message);
-    const waitMs = code === 429 ? retryDelayMs_(err, 20000) : 2000 * attempt;
+    const waitMs = code === 429 ? retryDelayMs_(err, 20000) : 5000 * Math.pow(2, attempt - 1); // 5, 10, 20 s
     if (attempt >= 4 || Date.now() + waitMs > deadline) {
       throw geminiError_(code === 429 ? 'rate_limit' : 'server', message);
     }
