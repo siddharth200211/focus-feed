@@ -110,3 +110,37 @@ function bqInspect_(cfg) {
   });
   return { dataset, tables, missing, expiry: bqExpiryStatus_(dataset, tables) };
 }
+
+/**
+ * Appends rows with one batch load job (newline-delimited JSON). Load jobs are free and
+ * allowed in the sandbox. The job ID is derived from the run ID, so a retried run can
+ * never load the same batch twice. Waits for the job and returns the rows loaded.
+ */
+function bqLoadRows_(cfg, tableName, rows, runId) {
+  const projectId = cfg.BQ_PROJECT_ID;
+  const job = {
+    jobReference: { projectId, jobId: `focusfeed_${tableName}_${runId}` },
+    configuration: {
+      load: {
+        destinationTable: { projectId, datasetId: cfg.BQ_DATASET, tableId: tableName },
+        sourceFormat: 'NEWLINE_DELIMITED_JSON',
+        writeDisposition: 'WRITE_APPEND',
+        createDisposition: 'CREATE_NEVER',
+      },
+    },
+  };
+  const data = Utilities.newBlob(rows.map(r => JSON.stringify(r)).join('\n'), 'application/octet-stream');
+  let res = BigQuery.Jobs.insert(job, projectId, data);
+  const ref = res.jobReference;
+  const deadline = Date.now() + 2 * 60 * 1000;
+  while (res.status.state !== 'DONE') {
+    if (Date.now() > deadline) throw new Error(`BigQuery load job ${ref.jobId} is still running after 2 minutes.`);
+    Utilities.sleep(1500);
+    res = BigQuery.Jobs.get(projectId, ref.jobId, { location: ref.location });
+  }
+  if (res.status.errorResult) {
+    const details = (res.status.errors || []).slice(0, 3).map(e => e.message).join(' | ');
+    throw new Error(`Loading ${tableName} failed: ${res.status.errorResult.message}${details ? ' — ' + details : ''}`);
+  }
+  return Number(res.statistics && res.statistics.load && res.statistics.load.outputRows) || rows.length;
+}

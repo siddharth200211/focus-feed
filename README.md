@@ -4,7 +4,7 @@ A swipe feed of YouTube Shorts about **one topic you choose**, so scrolling beco
 
 Under the hood it's a small data pipeline. A daily job collects Shorts from the YouTube Data API, Gemini scores each one for relevance, and the results go through `raw → scored → feed` tables. A mobile web app serves the feed and logs what you watch or skip, and that feeds back into the pipeline. It runs entirely on free tiers, and anyone can run their own copy.
 
-> **Status: Phase 1, in progress.** Done so far: Settings tab, Setup menu (spreadsheet tabs or BigQuery tables), tests, and GitHub → Apps Script deploys. Next up: collect, score, feed build, and the web app.
+> **Status: Phase 1, in progress.** Done so far: Settings tab, Setup menu (spreadsheet tabs or BigQuery tables), tests, GitHub → Apps Script deploys, and step 1 (daily collect). Next up: score, feed build, and the web app.
 
 ## How it works
 
@@ -22,7 +22,7 @@ flowchart LR
 
 | Step | What happens | Runs |
 |---|---|---|
-| 1. Collect | Searches YouTube for your topic and fetches each video's duration and embeddability | Daily trigger |
+| 1. Collect | Searches YouTube for your topic (short, embeddable videos; the day's searches rotate through topic phrasings and sort orders) and fetches each video's duration, embeddability and stats. Stops early rather than exceed the daily quota | Daily trigger |
 | 2. Score | Gemini rates each video 0–10 for fit with the topic. Only embeddable videos scoring ≥ `MIN_SCORE` are kept | After collect |
 | 3. Store | `raw_videos` → `scored_videos` → `feed`, plus `pipeline_runs` for monitoring | Each run |
 | 4. Show | Swipe UI with embedded players. Opens on a phone with no login | On demand |
@@ -50,6 +50,7 @@ Both modes use one schema ([`Schema.gs`](apps-script/Schema.gs)), so switching m
 4. **Add a Gemini key.** Create one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey), ideally in a Cloud project **with no billing**, so it can never cost money. Then use **FocusFeed → Set Gemini API key…**. The key is checked, then stored in Script Properties. It never goes in the sheet or the code.
 5. **(Optional) Use BigQuery.** In **Settings**, set `STORAGE` to `bigquery` and fill in `BQ_PROJECT_ID`, then run **Setup** again. It creates the dataset and tables.
 6. **Check it.** **FocusFeed → Check setup** shows which Google account the script runs as, and whether the settings, tabs or tables, YouTube API and Gemini key all work.
+7. **Collect.** Setup schedules the daily collect at `COLLECT_HOUR`. To fill the feed straight away, run **FocusFeed → Run collect now**: about a minute, roughly 5,000 YouTube units, and the result is a few hundred to a thousand-plus new rows in `raw_videos`.
 
 > Keep the sheet, the script, the BigQuery project and the Gemini key on **one Google account**. Check setup shows which account the script runs as.
 
@@ -63,6 +64,7 @@ Everything is configured in the **Settings** tab. Setup adds any new settings wi
 | `SEARCH_TERMS` | | Optional extra search phrases, comma-separated. Leave blank to build searches from `TOPIC` |
 | `SEARCH_LANGUAGE` | `en` | Language for YouTube search results |
 | `SEARCHES_PER_DAY` | `50` | 100 quota units each, out of 10,000 a day. Maximum is 90 |
+| `COLLECT_HOUR` | `14` | Hour of the daily collect, in the script's time zone. YouTube's quota resets at midnight Pacific (about 13:30 in India) |
 | `MIN_SCORE` | `7` | Lowest Gemini score (0–10) that reaches the feed |
 | `SCORE_BATCH_SIZE` | `25` | Videos per Gemini call |
 | `GEMINI_MODEL` | `gemini-flash-latest` | An alias for the newest Flash model. Put a specific model name here to pin one |
@@ -114,7 +116,9 @@ apps-script/
   Schema.gs         table definitions shared by both storage modes
   SheetsStore.gs    sheets backend
   BigQueryStore.gs  BigQuery backend (create, additive migrations, expiry status)
-  Setup.gs          FocusFeed menu: Setup, Gemini key, Check setup, sandbox reminder
+  Pipeline.gs       shared plumbing: run IDs, storage-agnostic appends, pipeline_runs log, YouTube quota budget
+  Collect.gs        step 1: rotating searches → video details → raw_videos
+  Setup.gs          FocusFeed menu: Setup, Gemini key, Run collect now, Check setup, sandbox reminder
 tests/gas.test.js   runs the real .gs files against in-memory fakes of Google services
 ```
 

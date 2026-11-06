@@ -16,6 +16,8 @@ const SETTINGS = [
     note: 'Language code for YouTube search results (e.g. en, hi).' },
   { key: 'SEARCHES_PER_DAY', def: 50, type: 'int', min: 1, max: 90,
     note: 'Each search costs 100 of the 10,000 free YouTube API units a day. 90 is the ceiling, leaving room for video-detail lookups.' },
+  { key: 'COLLECT_HOUR', def: 14, type: 'int', min: 0, max: 23,
+    note: 'Hour of the day (script time zone) for the daily collect run. YouTube quota resets at midnight Pacific time (about 13:30 in India), so 14 starts each run with a full day of quota. Run Setup after changing.' },
   { key: 'MIN_SCORE', def: 7, type: 'int', min: 0, max: 10,
     note: 'Gemini scores every video 0-10 for how well it fits TOPIC. Only videos at or above this reach the feed.' },
   { key: 'SCORE_BATCH_SIZE', def: 25, type: 'int', min: 1, max: 50,

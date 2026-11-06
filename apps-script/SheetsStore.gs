@@ -40,3 +40,28 @@ function sheetsRemoveEmptyDefaultTab_(ss) {
     ss.deleteSheet(sh);
   }
 }
+
+/**
+ * Appends rows (objects keyed by column name) under the tab's header, matching columns by
+ * name. TIMESTAMP values become real dates. Then deletes the oldest rows beyond maxRows
+ * (Lite retention). Returns the number of rows appended.
+ */
+function sheetsAppendRows_(ss, tableName, rows, maxRows) {
+  const sh = ss.getSheetByName(tableName);
+  if (!sh) throw new Error(`No "${tableName}" tab. Run FocusFeed → Setup.`);
+  const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h).trim());
+  const types = {};
+  TABLES[tableName].fields.forEach(f => { types[f[0]] = f[1]; });
+  const values = rows.map(r => header.map(h => {
+    const v = r[h];
+    if (v === undefined || v === null) return '';
+    return types[h] === 'TIMESTAMP' ? new Date(v) : v;
+  }));
+  const start = sh.getLastRow() + 1;
+  const short = start + values.length - 1 - sh.getMaxRows();
+  if (short > 0) sh.insertRowsAfter(sh.getMaxRows(), short);
+  sh.getRange(start, 1, values.length, header.length).setValues(values);
+  const dataRows = sh.getLastRow() - 1;
+  if (maxRows && dataRows > maxRows) sh.deleteRows(2, dataRows - maxRows);
+  return values.length;
+}

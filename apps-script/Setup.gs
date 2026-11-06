@@ -4,6 +4,7 @@
  *   FocusFeed → Setup                  Settings tab + data tabs, and BigQuery dataset/tables
  *                                      when STORAGE = bigquery. Safe to run again any time.
  *   FocusFeed → Set Gemini API key…    stores the key in Script Properties (never in the sheet)
+ *   FocusFeed → Run collect now        pipeline step 1 on demand (it also runs daily)
  *   FocusFeed → Check setup            read-only health check: account, settings, APIs, tables
  */
 const REMIND_DAYS_BEFORE_EXPIRY = 15; // sandbox tables live 60 days → reminder on day 45
@@ -14,6 +15,8 @@ function onOpen() {
   SpreadsheetApp.getUi().createMenu('FocusFeed')
     .addItem('Setup', 'setup')
     .addItem('Set Gemini API key…', 'setGeminiApiKey')
+    .addSeparator()
+    .addItem('Run collect now', 'runCollect')
     .addSeparator()
     .addItem('Check setup', 'checkSetup')
     .addToUi();
@@ -87,6 +90,8 @@ function setupInner_() {
     if (migrated.length) out.push('✓ Columns added: ' + migrated.join('; '));
     out.push(applyExpiryStatus_(ss, bq.expiry));
   }
+
+  out.push(ensureDailyTrigger_('runCollect', cfg.COLLECT_HOUR, 'Daily collect'));
 
   if (!props.getProperty(GEMINI_KEY_PROP)) out.push('', 'Next: FocusFeed → Set Gemini API key…');
   tell_('FocusFeed setup done', out);
@@ -171,6 +176,15 @@ function checkSetup() {
     }
   }
 
+  const scheduled = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'runCollect');
+  out.push(scheduled ? `✓ Daily collect scheduled (around ${cfg ? cfg.COLLECT_HOUR : '?'}:00)` : '✗ Daily collect not scheduled — run Setup');
+  const last = lastRun_('collect');
+  if (last) {
+    out.push(`${last.status === 'ok' ? '✓' : '✗'} Last collect: ${String(last.at).slice(0, 16).replace('T', ' ')} UTC, ` +
+      `${last.status}, ${last.rows} rows${last.message ? ' — ' + last.message : ''}`);
+  }
+  out.push(`YouTube units used today: ${ytUnitsUsedToday_()} of ${YT_DAILY_QUOTA}`);
+
   try {
     YouTube.I18nLanguages.list('snippet', { hl: 'en' }); // 1 quota unit
     out.push('✓ YouTube Data API reachable');
@@ -188,6 +202,15 @@ function checkSetup() {
       : check.modelOk ? `✓ Gemini key works (model ${model})` : '⚠ ' + check.message);
   }
   tell_('FocusFeed check', out);
+}
+
+/* ---------- triggers ---------- */
+
+/** One daily trigger per handler: replaces any existing one so Setup can be re-run safely. */
+function ensureDailyTrigger_(handler, hour, label) {
+  deleteTriggersFor_(handler);
+  ScriptApp.newTrigger(handler).timeBased().everyDays(1).atHour(hour).create();
+  return `✓ ${label} scheduled daily around ${hour}:00 (${Session.getScriptTimeZone()})`;
 }
 
 /* ---------- BigQuery sandbox expiry reminder ---------- */
