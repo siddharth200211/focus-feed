@@ -1,0 +1,84 @@
+# Tests every push and pull request; pushes apps-script/ to Apps Script on every push to main.
+#
+# One-time setup in GitHub → Settings → Secrets and variables → Actions:
+#   Secret    CLASPRC_JSON   contents of ~/.clasprc.json after `clasp login` (the account that owns the script)
+#   Variable  SCRIPT_ID      Apps Script editor → Project Settings → Script ID
+#   Variable  DEPLOYMENT_ID  optional: the web app deployment to move to each new version
+# Without CLASPRC_JSON and SCRIPT_ID (e.g. on a fork) the deploy job is skipped, tests still run.
+name: Test and deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'LICENSE']
+  pull_request:
+    paths-ignore: ['**.md', 'LICENSE']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - run: npm test
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: apps-script-deploy
+      cancel-in-progress: false
+    env:
+      CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+      SCRIPT_ID: ${{ vars.SCRIPT_ID }}
+      DEPLOYMENT_ID: ${{ vars.DEPLOYMENT_ID }}
+    steps:
+      - name: Check deploy settings
+        id: cfg
+        run: |
+          if [ -z "$CLASPRC_JSON" ] || [ -z "$SCRIPT_ID" ]; then
+            echo "::notice title=Deploy skipped::Add the CLASPRC_JSON secret and SCRIPT_ID variable to deploy to Apps Script."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v6
+        if: steps.cfg.outputs.ready == 'true'
+
+      - uses: actions/setup-node@v6
+        if: steps.cfg.outputs.ready == 'true'
+        with:
+          node-version: 22
+
+      - name: Install clasp
+        if: steps.cfg.outputs.ready == 'true'
+        run: npm install --global @google/clasp@3.4.1
+
+      - name: Write clasp credentials and project file
+        if: steps.cfg.outputs.ready == 'true'
+        run: |
+          umask 077
+          printf '%s' "$CLASPRC_JSON" > "$HOME/.clasprc.json"
+          printf '{"scriptId":"%s","rootDir":"apps-script"}\n' "$SCRIPT_ID" > .clasp.json
+
+      - name: Push code to Apps Script
+        if: steps.cfg.outputs.ready == 'true'
+        run: clasp push --force
+
+      - name: Point the web app at the new code
+        if: steps.cfg.outputs.ready == 'true' && env.DEPLOYMENT_ID != ''
+        run: clasp update-deployment "$DEPLOYMENT_ID" --description "main@${GITHUB_SHA::7}"
+
+      - name: Remove credentials
+        if: always()
+        run: rm -f "$HOME/.clasprc.json"

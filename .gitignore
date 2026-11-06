@@ -1,0 +1,9 @@
+# clasp: personal project binding and login tokens — never commit these
+.clasp.json
+.clasprc.json
+# local secrets
+.env
+*.key
+# dependencies
+node_modules/
+.DS_Store

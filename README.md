@@ -1,1 +1,130 @@
-# focus-feed
+# FocusFeed
+
+A swipe feed of YouTube Shorts about **one topic you choose**, so scrolling becomes study time. Mine is TOEFL. Yours can be anything.
+
+Under the hood it's a small data pipeline. A daily job collects Shorts from the YouTube Data API, Gemini scores each one for relevance, and the results go through `raw → scored → feed` tables. A mobile web app serves the feed and logs what you watch or skip, and that feeds back into the pipeline. It runs entirely on free tiers, and anyone can run their own copy.
+
+> **Status: Phase 1, in progress.** Done so far: Settings tab, Setup menu (spreadsheet tabs or BigQuery tables), tests, and GitHub → Apps Script deploys. Next up: collect, score, feed build, and the web app.
+
+## How it works
+
+```mermaid
+flowchart LR
+  YT[YouTube Data API] -->|daily, ~50 searches| C[Collect]
+  C --> R[(raw_videos)]
+  R -->|25 videos per call| S[Score with Gemini]
+  S --> SC[(scored_videos)]
+  SC -->|score ≥ 7 and embeddable| F[(feed)]
+  F -->|50 at a time| W[Swipe web app]
+  W -->|watch / skip| E[events tab]
+  E -->|nightly batch load| EV[(events)]
+```
+
+| Step | What happens | Runs |
+|---|---|---|
+| 1. Collect | Searches YouTube for your topic and fetches each video's duration and embeddability | Daily trigger |
+| 2. Score | Gemini rates each video 0–10 for fit with the topic. Only embeddable videos scoring ≥ `MIN_SCORE` are kept | After collect |
+| 3. Store | `raw_videos` → `scored_videos` → `feed`, plus `pipeline_runs` for monitoring | Each run |
+| 4. Show | Swipe UI with embedded players. Opens on a phone with no login | On demand |
+| 5. Learn | Watches and skips land in the `events` tab and get batch-loaded nightly | Nightly |
+
+Each step is a separate job. Phase 2 swaps steps 1–3 for Python, dbt and an orchestrator, and the UI stays the same.
+
+## Two storage modes, one codebase
+
+| | `sheets` (Lite, default) | `bigquery` |
+|---|---|---|
+| Needs | Only a Google account | A Google Cloud project (the free [BigQuery sandbox](https://cloud.google.com/bigquery/docs/sandbox) is enough, no card) |
+| Where data lives | Tabs in the spreadsheet | Dataset `focus_feed`: tables partitioned by day and clustered by `video_id` |
+| Limits | Oldest rows are pruned above `LITE_MAX_ROWS` to stay under the 10M-cell limit | Sandbox tables expire after 60 days unless you enable billing (see below) |
+
+Both modes use one schema ([`Schema.gs`](apps-script/Schema.gs)), so switching modes means changing one setting and running Setup again.
+
+## Set up your own copy
+
+1. **Create the sheet and script.** Make a new Google Sheet, then open **Extensions → Apps Script**.
+2. **Add the code.** Pick one way:
+   - *Copy and paste:* in the editor, open **Project Settings** and tick *Show "appsscript.json"*. Then paste [`apps-script/appsscript.json`](apps-script/appsscript.json), and paste each `.gs` file from [`apps-script/`](apps-script) into a script file with the same name. The manifest turns on the YouTube and BigQuery services for you. You may want to change `timeZone` in the manifest, because daily jobs run on that clock.
+   - *clasp:* `npm i -g @google/clasp`, `clasp login`, copy `.clasp.json.example` to `.clasp.json`, paste your Script ID into it (**Project Settings → IDs**), then run `clasp push`.
+3. **Run Setup.** Reload the sheet and choose **FocusFeed → Setup**. Approve the permissions and type your topic. Setup creates the **Settings** tab and the data tabs.
+4. **Add a Gemini key.** Create one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey), ideally in a Cloud project **with no billing**, so it can never cost money. Then use **FocusFeed → Set Gemini API key…**. The key is checked, then stored in Script Properties. It never goes in the sheet or the code.
+5. **(Optional) Use BigQuery.** In **Settings**, set `STORAGE` to `bigquery` and fill in `BQ_PROJECT_ID`, then run **Setup** again. It creates the dataset and tables.
+6. **Check it.** **FocusFeed → Check setup** shows which Google account the script runs as, and whether the settings, tabs or tables, YouTube API and Gemini key all work.
+
+> Keep the sheet, the script, the BigQuery project and the Gemini key on **one Google account**. Check setup shows which account the script runs as.
+
+## Settings
+
+Everything is configured in the **Settings** tab. Setup adds any new settings without overwriting your values.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `TOPIC` | (asked on first Setup) | The one topic your feed is about |
+| `SEARCH_TERMS` | | Optional extra search phrases, comma-separated. Leave blank to build searches from `TOPIC` |
+| `SEARCH_LANGUAGE` | `en` | Language for YouTube search results |
+| `SEARCHES_PER_DAY` | `50` | 100 quota units each, out of 10,000 a day. Maximum is 90 |
+| `MIN_SCORE` | `7` | Lowest Gemini score (0–10) that reaches the feed |
+| `SCORE_BATCH_SIZE` | `25` | Videos per Gemini call |
+| `GEMINI_MODEL` | `gemini-flash-latest` | An alias for the newest Flash model. Put a specific model name here to pin one |
+| `FEED_PAGE_SIZE` | `50` | Videos the web app loads at a time |
+| `STORAGE` | `sheets` | `sheets` or `bigquery` |
+| `LITE_MAX_ROWS` | `100000` | Sheets mode only: row cap per data tab |
+| `BQ_PROJECT_ID` | | BigQuery mode only: Cloud project **ID** |
+| `BQ_DATASET` | `focus_feed` | BigQuery mode only: dataset name |
+| `BQ_LOCATION` | `US` | BigQuery mode only: dataset location, which can't change after creation |
+| `BQ_SANDBOX_EXPIRY` | (set by Setup) | When sandbox tables will be deleted |
+
+## BigQuery sandbox: what to know
+
+- **Sandbox-safe by design.** Tables are created through the API, and data only arrives through **batch load jobs**. Nothing uses DML or streaming inserts, which the sandbox doesn't allow.
+- **The 60-day clock.** Sandbox tables and partitions are deleted 60 days after creation. Setup reads the real expiration times and schedules a reminder email **15 days before** (day 45). The sheet also shows a notice when you open it in the last 15 days.
+- **To keep your data:** enable billing on the project (the free tier of 10 GB storage and 1 TB of queries a month still applies). Then remove the dataset's default expiration and each table's expiration and partition expiration ([guide](https://cloud.google.com/bigquery/docs/sandbox)), and run **Setup** again. Setup re-checks the tables and stops the reminder once nothing expires.
+
+## Quotas and cost
+
+| Service | Free allowance | FocusFeed uses |
+|---|---|---|
+| YouTube Data API | 10,000 units a day | 50 searches × 100 units, plus about 1 unit per 50 video lookups. Roughly 5,100 a day |
+| Gemini API | Free tier on a no-billing project | About 2,500 videos a day ÷ 25 per call. Roughly 100 calls a day |
+| BigQuery | Sandbox, or the free tier after billing | A few MB a day |
+| Apps Script | Consumer account limits | One daily job and one nightly job |
+
+## Deploy from GitHub (optional)
+
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) runs the tests on every push and pull request. On a push to `main` it runs `clasp push` (pinned to `@google/clasp@3.4.1`).
+
+To enable it, open **Settings → Secrets and variables → Actions** in your repo or fork and add:
+
+| Name | Type | Value |
+|---|---|---|
+| `CLASPRC_JSON` | Secret | Contents of `~/.clasprc.json` after `clasp login` (on Windows: `%USERPROFILE%\.clasprc.json`). Log in with the account that owns the script |
+| `SCRIPT_ID` | Variable | Apps Script → **Project Settings → Script ID** |
+| `DEPLOYMENT_ID` | Variable, optional | Your web app deployment ID. Each deploy then moves the web app to the new code |
+
+Without the first two, the deploy job is skipped and the tests still run.
+
+`CLASPRC_JSON` works like a password for your Apps Script projects. If it ever leaks, remove **clasp – The Apps Script CLI** at [myaccount.google.com/connections](https://myaccount.google.com/connections), run `clasp login` again and update the secret. With `DEPLOYMENT_ID` set, every deploy creates a script version. Apps Script keeps a limited number of versions, so delete old ones under **Deploy → Manage deployments** now and then.
+
+## Development
+
+```text
+apps-script/
+  appsscript.json   manifest: V8, YouTube + BigQuery advanced services, scopes, web app access
+  Config.gs         Settings tab: definitions, defaults, validation
+  Schema.gs         table definitions shared by both storage modes
+  SheetsStore.gs    sheets backend
+  BigQueryStore.gs  BigQuery backend (create, additive migrations, expiry status)
+  Setup.gs          FocusFeed menu: Setup, Gemini key, Check setup, sandbox reminder
+tests/gas.test.js   runs the real .gs files against in-memory fakes of Google services
+```
+
+Run `npm test` (Node 20 or later, no install needed). Schema changes are **additive only**: add columns at the end, and Setup adds them to existing tabs and tables as `NULLABLE`.
+
+## Roadmap
+
+- **Phase 1 (now):** collect → score → feed in Apps Script, the swipe web app, a nightly `events` load, and pruning for Lite mode.
+- **Phase 2 (January 2027):** Python, dbt and GitHub Actions or Airflow replace steps 1–3. The UI stays the same.
+
+## License
+
+[MIT](LICENSE)

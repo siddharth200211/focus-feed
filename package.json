@@ -1,0 +1,14 @@
+{
+  "name": "focus-feed",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A swipe feed of YouTube Shorts limited to one topic you choose. Apps Script + Google Sheets or BigQuery.",
+  "scripts": {
+    "test": "node --test tests/gas.test.js",
+    "push": "clasp push"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
