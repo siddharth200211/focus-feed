@@ -830,7 +830,7 @@ test('score: skipped or invalid answers are stored as unscored and not retried',
 });
 
 test('score: a 429 is retried after Gemini\'s retryDelay', () => {
-  const env = scoreEnv({ gemini: { on: { 3: '429' } } });
+  const env = scoreEnv({ gemini: { on: { 3: '429' } }, fallback: 'none' }); // no fallback: wait it out
   env.run('runScore()');
   assert.ok(env.sleeps.includes(7500), `slept ${env.sleeps}`);
   assert.equal(env.bq.rows.scored_videos.filter(s => s.score === null).length, 0);
@@ -842,7 +842,7 @@ test('score: daily Gemini quota stops cleanly, keeps earlier batches, no continu
   env.run('runScore()');
   assert.equal(env.gem.calls.length, 3);
   assert.equal(env.bq.rows.scored_videos.length, 50, 'first two batches saved');
-  assert.match(env.lastAlert().msg, /Gemini daily quota used up/);
+  assert.match(env.lastAlert().msg, /every Gemini model is out of daily quota/);
   assert.match(env.lastAlert().msg, /left for the next run/);
   assert.equal(env.triggers.filter(t => t.fn === 'continueScore').length, 0);
   assert.equal(env.bq.rows.pipeline_runs.find(r => r.step === 'score').rows_in, 50);
@@ -852,7 +852,8 @@ test('score: an overloaded model stops for now and continues a minute later', ()
   const env = scoreEnv({ gemini: { on: { 2: '500', 3: '500', 4: '500', 5: '500' } }, fallback: 'none' });
   env.run('runScore()');
   assert.equal(env.bq.rows.scored_videos.length, 25);
-  assert.match(env.lastAlert().msg, /Gemini is busy \(The model is overloaded\)/);
+  assert.match(env.lastAlert().msg, /gemini-flash-latest overloaded \(The model is overloaded\)/);
+  assert.match(env.lastAlert().msg, /no Gemini model is available right now/);
   const cont = env.triggers.filter(t => t.fn === 'continueScore');
   assert.equal(cont.length, 1);
   assert.equal(cont[0].after, 60000);
@@ -1032,24 +1033,24 @@ test('fallback: an overloaded main model hands over to the next one for the rest
   assert.equal(scored.length, feedEligible(env.bq.rows.raw_videos).length, 'nothing lost: the failed batch was redone');
   assert.ok(scored.every(s => s.model === 'gemini-flash-lite-latest-001'));
   const msg = env.lastAlert().msg;
-  assert.match(msg, /gemini-flash-latest overloaded; switched to gemini-flash-lite-latest/);
+  assert.match(msg, /gemini-flash-latest overloaded \(The model is overloaded\); switched to gemini-flash-lite-latest/);
   assert.match(msg, /Gemini calls \(gemini-flash-lite-latest-001\)/);
   assert.equal(env.bq.rows.pipeline_runs.find(r => r.step === 'score').rows_in, scored.length);
 });
 
 test('fallback: daily quota on one model and a missing model are both skipped', () => {
-  const env = scoreEnv({ gemini: { on: { 4: 'daily' }, models: { 'gemini-flash-lite-latest': 'missing' } } });
+  const env = scoreEnv({ gemini: { on: { 4: 'daily' }, models: { 'gemini-flash-lite-latest': 'missing' } }, fallback: 'gemini-flash-lite-latest, gemini-2.5-flash' });
   env.run('runScore()');
   const msg = env.lastAlert().msg;
-  assert.match(msg, /gemini-flash-latest out of daily quota; switched to gemini-flash-lite-latest/);
-  assert.match(msg, /gemini-flash-lite-latest not found; switched to gemini-2\.5-flash/);
+  assert.match(msg, /gemini-flash-latest out of daily quota \(Quota exceeded: requests per day\); switched to gemini-flash-lite-latest/);
+  assert.match(msg, /gemini-flash-lite-latest not found \(.*\); switched to gemini-2\.5-flash/);
   assert.match(msg, /\(gemini-test-flash-001, gemini-2\.5-flash-001\)/);
   assert.equal(env.bq.rows.scored_videos.length, feedEligible(env.bq.rows.raw_videos).length);
 });
 
 test('fallback: when every model is busy it stops and retries later', () => {
   const busy = { 'gemini-flash-latest': 'busy', 'gemini-flash-lite-latest': 'busy', 'gemini-2.5-flash': 'busy' };
-  const env = scoreEnv({ gemini: { models: busy } });
+  const env = scoreEnv({ gemini: { models: busy }, fallback: 'gemini-flash-lite-latest, gemini-2.5-flash' });
   env.run('runScore()');
   assert.deepEqual(env.gem.calls.map(c => c.model), ['gemini-flash-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-flash-lite-latest',
     'gemini-2.5-flash', 'gemini-2.5-flash', 'gemini-2.5-flash', 'gemini-2.5-flash'], 'last model gets the full 4 tries');
@@ -1059,7 +1060,7 @@ test('fallback: when every model is busy it stops and retries later', () => {
 
 test('fallback: every model out of daily quota stops without a continuation', () => {
   const daily = { 'gemini-flash-latest': 'daily', 'gemini-flash-lite-latest': 'daily', 'gemini-2.5-flash': 'daily' };
-  const env = scoreEnv({ gemini: { models: daily } });
+  const env = scoreEnv({ gemini: { models: daily }, fallback: 'gemini-flash-lite-latest, gemini-2.5-flash' });
   env.run('runScore()');
   assert.equal(env.gem.calls.length, 3);
   assert.equal(env.triggers.filter(t => t.fn === 'continueScore').length, 0);
@@ -1069,11 +1070,41 @@ test('fallback: a main model that does not exist, with fallback off, explains wh
   const env = scoreEnv({ gemini: { models: { 'gemini-flash-latest': 'missing' } }, fallback: 'none' });
   env.run('runScore()');
   assert.equal(env.lastAlert().title, 'Score failed');
-  assert.match(env.lastAlert().msg, /model "gemini-flash-latest" was not found\. Fix GEMINI_MODEL/);
+  assert.match(env.lastAlert().msg, /None of the Gemini models exist \(gemini-flash-latest\)\. Fix GEMINI_MODEL/);
 });
 
 test('checkSetup lists which fallback models work', () => {
-  const env = scoreEnv({ gemini: { models: { 'gemini-2.5-flash': 'missing' } } });
+  const env = scoreEnv({ gemini: { models: { 'gemini-2.5-flash': 'missing' } }, fallback: 'gemini-flash-lite-latest, gemini-2.5-flash' });
   env.run('checkSetup()');
   assert.match(env.lastAlert().msg, /Fallback models: gemini-flash-lite-latest ✓ · gemini-2\.5-flash ✗ not found/);
+});
+
+test('fallback: busy models followed by a missing last model stop gently and retry, not fail', () => {
+  const env = scoreEnv({
+    gemini: { models: { 'gemini-flash-latest': 'busy', 'gemini-flash-lite-latest': 'busy', 'gemini-2.5-flash': 'missing' } },
+    fallback: 'gemini-flash-lite-latest, gemini-2.5-flash',
+  });
+  env.run('runScore()');
+  assert.equal(env.lastAlert().title, 'Score finished');
+  const msg = env.lastAlert().msg;
+  assert.match(msg, /gemini-flash-latest overloaded \(The model is overloaded\); switched to gemini-flash-lite-latest/);
+  assert.match(msg, /gemini-2\.5-flash not found/);
+  assert.match(msg, /no Gemini model is available right now/);
+  assert.equal(env.triggers.filter(t => t.fn === 'continueScore').length, 1, 'tries again in 10 minutes');
+});
+
+test('fallback: a rate limit hands over at once when another model is left', () => {
+  const env = scoreEnv({ gemini: { on: { 1: '429' } } });
+  env.run('runScore()');
+  assert.equal(env.sleeps.filter(ms => ms === 7500).length, 0, 'did not wait out the rate limit');
+  assert.equal(env.gem.calls[1].model, 'gemini-flash-lite-latest');
+  assert.match(env.lastAlert().msg, /gemini-flash-latest rate-limited \(Resource exhausted\); switched to gemini-flash-lite-latest/);
+});
+
+test('a failed run still shows what happened with each model', () => {
+  const env = scoreEnv({ gemini: { on: { 1: '500', 2: '500', 3: 'badkey' } } });
+  env.run('runScore()');
+  assert.equal(env.lastAlert().title, 'Score failed');
+  assert.match(env.lastAlert().msg, /API key not valid/);
+  assert.match(env.lastAlert().msg, /⚠ gemini-flash-latest overloaded .*; switched to gemini-flash-lite-latest/);
 });

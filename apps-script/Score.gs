@@ -56,7 +56,8 @@ function runScore() {
     result = score_();
   } catch (e) {
     if (!ui_()) throw e;
-    return tell_('Score failed', ['✗ ' + e.message, '', 'Anything already scored was saved, and the run is logged in pipeline_runs.']);
+    return tell_('Score failed', ['✗ ' + e.message].concat(e.notes && e.notes.length ? ['', '⚠ ' + e.notes.join('\n⚠ ')] : [],
+      ['', 'Anything already scored was saved, and the run is logged in pipeline_runs.']));
   } finally {
     lock.releaseLock();
   }
@@ -83,7 +84,7 @@ function score_() {
     run_id: newRunId_(started), step: 'score', started_at: started.toISOString(), finished_at: null,
     status: 'ok', rows_in: 0, rows_out: 0, quota_units: 0, message: '',
   };
-  const stats = { total: 0, calls: 0, callMs: 0, model: null, notes: [], stopped: null, titles: {}, rows: [] };
+  const stats = { total: 0, calls: 0, callMs: 0, model: null, notes: [], failures: [], stopped: null, titles: {}, rows: [] };
   let failure = null;
   let unsaved = [];
   let saves = 0;
@@ -115,7 +116,7 @@ function score_() {
       run.rows_in += batch.length;
       try {
         const lastModel = current === models.length - 1;
-        const res = scoreBatch_(cfg, run, batch, deadline, models[current], lastModel ? 4 : 2);
+        const res = scoreBatch_(cfg, run, batch, deadline, models[current], lastModel);
         stats.calls++;
         stats.callMs += res.ms;
         run.quota_units++;
@@ -123,14 +124,28 @@ function score_() {
         if (stats.modelsUsed.indexOf(res.model) === -1) stats.modelsUsed.push(res.model);
         keep(res.rows);
       } catch (e) {
-        const switchable = ['server', 'rate_limit', 'daily_quota', 'not_found'].indexOf(e.kind) !== -1;
-        if (switchable && current < models.length - 1) {
-          const why = { server: 'overloaded', rate_limit: 'rate-limited', daily_quota: 'out of daily quota', not_found: 'not found' }[e.kind];
-          stats.notes.push(`${models[current]} ${why}; switched to ${models[current + 1]}`);
-          current++;
+        const why = { server: 'overloaded', rate_limit: 'rate-limited', daily_quota: 'out of daily quota', not_found: 'not found' }[e.kind];
+        if (why) {
+          stats.failures.push(e.kind);
           run.rows_in -= batch.length;
-          i -= cfg.SCORE_BATCH_SIZE; // same batch again with the next model
-          continue;
+          const detail = `${models[current]} ${why} (${String(e.message).slice(0, 120)})`;
+          if (current < models.length - 1) {
+            stats.notes.push(`${detail}; switched to ${models[current + 1]}`);
+            current++;
+            i -= cfg.SCORE_BATCH_SIZE; // same batch again with the next model
+            continue;
+          }
+          stats.notes.push(detail);
+          // No model left. Only a configuration problem if no model exists at all.
+          const real = stats.failures.filter(k => k !== 'not_found');
+          if (!real.length) {
+            throw new Error(`None of the Gemini models exist (${models.join(', ')}). Fix GEMINI_MODEL / GEMINI_FALLBACK_MODELS in Settings.`);
+          }
+          stats.stopped = real.every(k => k === 'daily_quota') ? 'quota' : 'busy';
+          stats.notes.push(stats.stopped === 'quota'
+            ? 'every Gemini model is out of daily quota; the rest is scored on the next run'
+            : 'no Gemini model is available right now; stopping for now');
+          break;
         }
         if (e.kind === 'output') {
           // Unusable answer for this batch: record it so these videos aren't retried forever.
@@ -141,9 +156,6 @@ function score_() {
           continue;
         }
         run.rows_in -= batch.length;
-        if (e.kind === 'daily_quota') { stats.stopped = 'quota'; stats.notes.push('Gemini daily quota used up; the rest is scored on the next run'); break; }
-        if (e.kind === 'rate_limit' || e.kind === 'server') { stats.stopped = 'busy'; stats.notes.push(`Gemini is busy (${e.message}); stopping for now`); break; }
-        if (e.kind === 'not_found') throw new Error(`Gemini model "${models[current]}" was not found. Fix GEMINI_MODEL / GEMINI_FALLBACK_MODELS in Settings.`);
         throw e; // bad key or bad request: nothing later will work either
       }
     }
@@ -163,7 +175,10 @@ function score_() {
   run.message = run.message.slice(0, 1000);
   run.finished_at = new Date().toISOString();
   logRun_(cfg, run);
-  if (failure) throw failure;
+  if (failure) {
+    failure.notes = stats.notes.filter(x => !/^avg /.test(x));
+    throw failure;
+  }
 
   stats.left = Math.max(0, stats.total - stats.rows.length);
   scheduleScoreContinuation_(stats);
@@ -247,7 +262,7 @@ LIMIT @max_rows`;
 }
 
 /** One Gemini call for up to SCORE_BATCH_SIZE videos. Short numeric IDs keep the model from mangling YouTube IDs. */
-function scoreBatch_(cfg, run, batch, deadline, model, maxAttempts) {
+function scoreBatch_(cfg, run, batch, deadline, model, lastModel) {
   const cut = (s, n) => String(s || '').slice(0, n);
   const items = batch.map((v, i) => ({
     id: String(i + 1),
@@ -258,7 +273,9 @@ function scoreBatch_(cfg, run, batch, deadline, model, maxAttempts) {
   }));
   const res = geminiJson_({
     model,
-    maxAttempts,
+    // With another model to fall back to, don't sit out rate limits: hand over at once.
+    maxAttempts: lastModel ? 4 : 2,
+    quickSwitch: !lastModel,
     system: scoringPrompt_(cfg.TOPIC),
     user: JSON.stringify(items),
     schema: SCORE_SCHEMA,

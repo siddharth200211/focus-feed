@@ -14,6 +14,7 @@ const THINKING_LADDER = [{ thinkingLevel: 'minimal' }, { thinkingLevel: 'low' },
  * Calls generateContent with a JSON response schema. Returns { data, modelVersion }.
  * Throws an Error with .kind = 'daily_quota' | 'rate_limit' | 'server' | 'not_found' | 'request' | 'output'.
  * opts.maxAttempts (default 4) — use fewer when another model can take over.
+ * opts.quickSwitch — on a rate limit, give up at once instead of waiting (a fallback exists).
  */
 function geminiJson_(opts) {
   const key = PropertiesService.getScriptProperties().getProperty(GEMINI_KEY_PROP);
@@ -59,6 +60,7 @@ function geminiJson_(opts) {
     }
     if (code === 429 && isDailyQuota_(err)) throw geminiError_('daily_quota', message);
     if (code === 404) throw geminiError_('not_found', message);
+    if (code === 429 && opts.quickSwitch) throw geminiError_('rate_limit', message);
     const retryable = code === 429 || code >= 500;
     if (!retryable) throw geminiError_('request', message);
     const waitMs = code === 429 ? retryDelayMs_(err, 20000) : 5000 * Math.pow(2, attempt - 1); // 5, 10, 20 s
