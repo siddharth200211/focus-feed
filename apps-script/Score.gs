@@ -83,7 +83,7 @@ function score_() {
     run_id: newRunId_(started), step: 'score', started_at: started.toISOString(), finished_at: null,
     status: 'ok', rows_in: 0, rows_out: 0, quota_units: 0, message: '',
   };
-  const stats = { total: 0, calls: 0, model: null, notes: [], stopped: null, titles: {}, rows: [] };
+  const stats = { total: 0, calls: 0, callMs: 0, model: null, notes: [], stopped: null, titles: {}, rows: [] };
   let failure = null;
   let unsaved = [];
   let saves = 0;
@@ -117,6 +117,7 @@ function score_() {
         const lastModel = current === models.length - 1;
         const res = scoreBatch_(cfg, run, batch, deadline, models[current], lastModel ? 4 : 2);
         stats.calls++;
+        stats.callMs += res.ms;
         run.quota_units++;
         stats.model = res.model;
         if (stats.modelsUsed.indexOf(res.model) === -1) stats.modelsUsed.push(res.model);
@@ -156,6 +157,8 @@ function score_() {
     failure = failure || e;
   }
   run.status = failure ? 'error' : 'ok';
+  stats.avgSec = stats.calls ? Math.round(stats.callMs / stats.calls / 1000) : 0;
+  if (stats.calls) stats.notes.push(`avg ${stats.avgSec}s per Gemini call`);
   run.message = (failure ? failure.message + (stats.notes.length ? '; ' : '') : '') + stats.notes.join('; ');
   run.message = run.message.slice(0, 1000);
   run.finished_at = new Date().toISOString();
@@ -273,7 +276,7 @@ function scoreBatch_(cfg, run, batch, deadline, model, maxAttempts) {
       ? scoreRow_(cfg, run, v.video_id, s, cut(x.reason, 200), usedModel)
       : scoreRow_(cfg, run, v.video_id, null, 'model skipped this video', usedModel);
   });
-  return { rows, model: usedModel };
+  return { rows, model: usedModel, ms: res.ms || 0 };
 }
 
 function scoreRow_(cfg, run, videoId, score, reason, model) {
@@ -315,7 +318,8 @@ function scoreSummary_(r) {
   const skipped = r.rows.length - scored.length;
   if (skipped) lines.push(`(${skipped} videos got no usable score and won't be retried)`);
   if (r.left) lines.push('', r.continuing ? `${n(r.left)} left: continuing automatically in about ${r.continueInMin === 1 ? 'a minute' : r.continueInMin + ' minutes'}.` : `${n(r.left)} left for the next run.`);
-  if (r.notes.length) lines.push('⚠ ' + r.notes.join('\n⚠ '));
-  lines.push(`Run ID: ${r.run.run_id}`);
+  const warnings = r.notes.filter(x => !/^avg /.test(x));
+  if (warnings.length) lines.push('⚠ ' + warnings.join('\n⚠ '));
+  lines.push(`Speed: ${r.avgSec}s per Gemini call · Run ID: ${r.run.run_id}`);
   return lines;
 }

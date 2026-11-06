@@ -974,27 +974,50 @@ test('score: saves every 2 batches, so a run cut off by Apps Script loses at mos
   assert.equal(log.rows_out, env.bq.rows.scored_videos.length);
 });
 
-test('score: thinking is switched off, and dropped once for a model that rejects the setting', () => {
+test('score: least thinking first; a model that rejects a setting steps down once and is remembered', () => {
+  const env = scoreEnv();
+  const inner = env.gem.fetch;
+  const sent = [];
+  env.gem.fetch = (url, opts) => {
+    if (/:generateContent$/.test(url)) {
+      const t = JSON.parse(opts.payload).generationConfig.thinkingConfig;
+      sent.push(t ? JSON.stringify(t) : 'none');
+      if (t && t.thinkingLevel) { // a 2.x-style model: knows thinkingBudget only
+        return { code: 400, body: JSON.stringify({ error: { code: 400, message: 'Invalid JSON payload received. Unknown name "thinkingLevel" at generation_config.thinking_config' } }) };
+      }
+    }
+    return inner(url, opts);
+  };
+  env.run('runScore()');
+  assert.deepEqual(sent.slice(0, 4), ['{"thinkingLevel":"minimal"}', '{"thinkingLevel":"low"}', '{"thinkingBudget":0}', '{"thinkingBudget":0}']);
+  assert.ok(sent.slice(2).every(t => t === '{"thinkingBudget":0}'), 'remembered for the rest of the run');
+  assert.equal(env.props['GEMINI_THINKING_STEP_gemini-flash-latest'], '2');
+  assert.equal(env.bq.rows.scored_videos.length, feedEligible(env.bq.rows.raw_videos).length);
+});
+
+test('score: a model that rejects every thinking setting gets none', () => {
   const env = scoreEnv();
   const inner = env.gem.fetch;
   let rejected = 0;
   env.gem.fetch = (url, opts) => {
     if (/:generateContent$/.test(url) && JSON.parse(opts.payload).generationConfig.thinkingConfig) {
       rejected++;
-      return { code: 400, body: JSON.stringify({ error: { code: 400, message: 'Thinking budget is not supported for this model.' } }) };
+      return { code: 400, body: JSON.stringify({ error: { code: 400, message: 'Thinking is not supported for this model.' } }) };
     }
     return inner(url, opts);
   };
   env.run('runScore()');
-  assert.equal(rejected, 1, 'rejected once, then remembered');
-  assert.equal(env.props['GEMINI_NO_THINKING_CONFIG_gemini-flash-latest'], '1');
+  assert.equal(rejected, 3);
+  assert.equal(env.props['GEMINI_THINKING_STEP_gemini-flash-latest'], '3');
   assert.equal(env.bq.rows.scored_videos.length, feedEligible(env.bq.rows.raw_videos).length);
 });
 
-test('score: requests ask for no thinking by default', () => {
+test('score: requests start with minimal thinking, and the popup shows the speed', () => {
   const env = scoreEnv();
   env.run('runScore()');
-  assert.deepEqual(env.gem.calls[0].body.generationConfig.thinkingConfig, { thinkingBudget: 0 });
+  assert.deepEqual(env.gem.calls[0].body.generationConfig.thinkingConfig, { thinkingLevel: 'minimal' });
+  assert.match(env.lastAlert().msg, /Speed: \d+s per Gemini call/);
+  assert.match(env.bq.rows.pipeline_runs.find(r => r.step === 'score').message, /avg \d+s per Gemini call/);
 });
 
 /* ---------- model fallback ---------- */

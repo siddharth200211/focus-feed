@@ -6,6 +6,9 @@
  * caller cleanly instead of failing the whole run.
  */
 const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/';
+// Least thinking first. Gemini 3+ models take thinkingLevel ("minimal" on Flash); 2.x models
+// take thinkingBudget 0. A model that rejects a step moves to the next one, remembered per model.
+const THINKING_LADDER = [{ thinkingLevel: 'minimal' }, { thinkingLevel: 'low' }, { thinkingBudget: 0 }, null];
 
 /**
  * Calls generateContent with a JSON response schema. Returns { data, modelVersion }.
@@ -20,13 +23,17 @@ function geminiJson_(opts) {
     contents: [{ role: 'user', parts: [{ text: opts.user }] }],
     generationConfig: { temperature: 0, responseMimeType: 'application/json', responseSchema: opts.schema },
   };
-  // Scoring is a quick classification: switch "thinking" off so each call returns in seconds.
-  // Models that reject this setting get it dropped once, and the choice is remembered.
+  // Scoring is a quick classification: as little "thinking" as the model allows, so each call
+  // returns in seconds instead of minutes.
   const props = PropertiesService.getScriptProperties();
-  const thinkingKey = 'GEMINI_NO_THINKING_CONFIG_' + opts.model;
-  if (opts.noThinking && !props.getProperty(thinkingKey)) {
-    body.generationConfig.thinkingConfig = { thinkingBudget: 0 };
-  }
+  const stepKey = 'GEMINI_THINKING_STEP_' + opts.model;
+  let step = opts.noThinking ? Math.min(Number(props.getProperty(stepKey)) || 0, THINKING_LADDER.length - 1) : THINKING_LADDER.length - 1;
+  const applyThinking = () => {
+    if (THINKING_LADDER[step]) body.generationConfig.thinkingConfig = THINKING_LADDER[step];
+    else delete body.generationConfig.thinkingConfig;
+  };
+  applyThinking();
+  const t0 = Date.now();
   const deadline = opts.deadline || Date.now() + 60 * 1000;
   for (let attempt = 1; ; attempt++) {
     const res = UrlFetchApp.fetch(GEMINI_URL + encodeURIComponent(opts.model) + ':generateContent', {
@@ -38,15 +45,16 @@ function geminiJson_(opts) {
     });
     const code = res.getResponseCode();
     const text = res.getContentText();
-    if (code === 200) return parseGeminiJson_(text);
+    if (code === 200) return Object.assign(parseGeminiJson_(text), { ms: Date.now() - t0 });
 
     let err = {};
     try { err = JSON.parse(text).error || {}; } catch (e) { /* not JSON */ }
     const message = err.message || `HTTP ${code}`;
     if (code === 400 && body.generationConfig.thinkingConfig && /thinking/i.test(message)) {
-      delete body.generationConfig.thinkingConfig;
-      props.setProperty(thinkingKey, '1');
-      attempt--; // not a real failure: send again without the setting
+      step++;
+      props.setProperty(stepKey, String(step));
+      applyThinking();
+      attempt--; // not a real failure: send again with the next setting
       continue;
     }
     if (code === 429 && isDailyQuota_(err)) throw geminiError_('daily_quota', message);
