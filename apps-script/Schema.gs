@@ -90,7 +90,7 @@ const TABLES = {
       ['status', 'STRING', 'NULLABLE', 'ok | error'],
       ['rows_in', 'INT64', 'NULLABLE', ''],
       ['rows_out', 'INT64', 'NULLABLE', ''],
-      ['quota_units', 'INT64', 'NULLABLE', 'YouTube API units used'],
+      ['quota_units', 'INT64', 'NULLABLE', 'API usage: YouTube units (collect) or Gemini calls (score)'],
       ['message', 'STRING', 'NULLABLE', 'Error or note'],
     ],
   },

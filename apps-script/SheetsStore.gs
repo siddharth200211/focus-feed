@@ -65,3 +65,19 @@ function sheetsAppendRows_(ss, tableName, rows, maxRows) {
   if (maxRows && dataRows > maxRows) sh.deleteRows(2, dataRows - maxRows);
   return values.length;
 }
+
+/** Reads a data tab as objects keyed by column name (TIMESTAMP cells come back as ISO strings). */
+function sheetsReadTable_(ss, tableName) {
+  const sh = ss.getSheetByName(tableName);
+  if (!sh || sh.getLastRow() < 2) return [];
+  const values = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  const header = values.shift().map(h => String(h).trim());
+  return values.map(row => {
+    const o = {};
+    header.forEach((h, i) => {
+      const v = row[i];
+      o[h] = v === '' ? null : Object.prototype.toString.call(v) === '[object Date]' ? v.toISOString() : v;
+    });
+    return o;
+  });
+}

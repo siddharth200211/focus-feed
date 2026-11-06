@@ -131,10 +131,42 @@ function fakeBigQuery({ sandbox = true, projects = ['my-project'] } = {}) {
         assert.equal(opts.location, 'US', 'job looked up in its location');
         return JSON.parse(JSON.stringify(store.jobs[id]));
       },
+      // Only the score-candidates query is understood (its SQL is checked separately).
+      // Answers "not complete" first and pages results 400 at a time, like the real API can.
+      query(req, p) {
+        store.calls.push('Jobs.query');
+        assert.equal(req.useLegacySql, false);
+        assert.match(req.query, /^-- focusfeed: score candidates\nSELECT /, 'read-only SELECT');
+        assert.doesNotMatch(req.query, /\b(INSERT|UPDATE|DELETE|MERGE)\b/i, 'no DML in the sandbox');
+        const prm = {};
+        req.queryParameters.forEach(q => { prm[q.name] = q.parameterType.type === 'INT64' ? Number(q.parameterValue.value) : q.parameterValue.value; });
+        assert.deepEqual(Object.keys(prm).sort(), ['max_duration', 'max_rows', 'prompt_version', 'topic']);
+        const done = new Set((store.rows.scored_videos || []).filter(s => s.topic === prm.topic && s.prompt_version === prm.prompt_version).map(s => s.video_id));
+        const latest = {};
+        (store.rows.raw_videos || []).filter(r => r.topic === prm.topic).forEach(r => { if (!latest[r.video_id] || r.collected_at > latest[r.video_id].collected_at) latest[r.video_id] = r; });
+        const all = Object.values(latest).filter(r => r.embeddable && r.duration_sec >= 1 && r.duration_sec <= prm.max_duration && !done.has(r.video_id))
+          .sort((a, b) => (a.collected_at < b.collected_at ? 1 : a.collected_at > b.collected_at ? -1 : a.video_id < b.video_id ? -1 : 1));
+        const fields = [['video_id', 'STRING'], ['title', 'STRING'], ['description', 'STRING'], ['channel_title', 'STRING'], ['duration_sec', 'INTEGER'], ['collected_at', 'TIMESTAMP'], ['total_candidates', 'INTEGER']];
+        const rows = all.slice(0, prm.max_rows).map(r => ({ f: fields.map(([n]) => ({ v: n === 'total_candidates' ? String(all.length) : n === 'collected_at' ? String(Date.parse(r.collected_at) / 1000) : r[n] === null ? null : String(r[n]) })) }));
+        const id = 'q' + store.calls.length;
+        const pages = [];
+        for (let i = 0; i < rows.length || i === 0; i += 400) pages.push(rows.slice(i, i + 400));
+        store.queries[id] = { pages, schema: { fields: fields.map(([name, type]) => ({ name, type })) } };
+        return { jobComplete: false, jobReference: { projectId: p, jobId: id, location: 'US' } };
+      },
+      getQueryResults(p, id, opts) {
+        store.calls.push('Jobs.getQueryResults');
+        const q = store.queries[id];
+        const page = opts.pageToken ? Number(opts.pageToken) : 0;
+        const out = { jobComplete: true, schema: q.schema, rows: q.pages[page].length ? q.pages[page] : undefined, jobReference: { jobId: id, location: 'US' } };
+        if (page + 1 < q.pages.length) out.pageToken = String(page + 1);
+        return JSON.parse(JSON.stringify(out));
+      },
     },
   };
   store.jobs = {};
   store.rows = {};
+  store.queries = {};
   return store;
 }
 
@@ -200,7 +232,7 @@ function formatUtc(d, f) {
 
 function load({ bq = fakeBigQuery(), yt = fakeYouTube(), prompts = [], fetch } = {}) {
   const book = fakeBook();
-  const props = {}, triggers = [], mails = [], alerts = [], fetches = [], logs = [];
+  const props = {}, triggers = [], mails = [], alerts = [], fetches = [], logs = [], sleeps = [];
   const ui = {
     Button: { OK: 'OK', CANCEL: 'CANCEL' }, ButtonSet: { OK: 'OK', OK_CANCEL: 'OK_CANCEL' },
     createMenu() { const m = { items: [], addItem: (l, f) => (m.items.push(f), m), addSeparator: () => m, addToUi: () => { ui.menu = m.items; } }; return m; },
@@ -214,13 +246,13 @@ function load({ bq = fakeBigQuery(), yt = fakeYouTube(), prompts = [], fetch } =
     PropertiesService: { getScriptProperties: () => ({ getProperty: k => (k in props ? props[k] : null), getProperties: () => Object.assign({}, props), setProperty: (k, v) => { props[k] = String(v); }, deleteProperty: k => { delete props[k]; } }) },
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock() { } }) },
     Session: { getEffectiveUser: () => ({ getEmail: () => 'me@example.com' }), getScriptTimeZone: () => 'Asia/Kolkata' },
-    Utilities: { formatDate: (d, tz, f) => formatUtc(d, f), newBlob: (text) => ({ text, getDataAsString: () => text }), sleep: () => { } },
+    Utilities: { formatDate: (d, tz, f) => formatUtc(d, f), newBlob: (text) => ({ text, getDataAsString: () => text }), sleep: ms => sleeps.push(ms) },
     Logger: { log: m => logs.push(m) },
     MailApp: { sendEmail: (to, subject, body) => mails.push({ to, subject, body }) },
     ScriptApp: {
       getProjectTriggers: () => triggers.slice(),
       deleteTrigger: t => triggers.splice(triggers.indexOf(t), 1),
-      newTrigger: fn => { const t = { fn, getHandlerFunction: () => fn }; const b = { timeBased: () => b, at: d => (t.at = d, b), everyDays: n => (t.everyDays = n, b), atHour: h => (t.atHour = h, b), create: () => (triggers.push(t), t) }; return b; },
+      newTrigger: fn => { const t = { fn, getHandlerFunction: () => fn }; const b = { timeBased: () => b, at: d => (t.at = d, b), everyDays: n => (t.everyDays = n, b), atHour: h => (t.atHour = h, b), after: ms => (t.after = ms, b), create: () => (triggers.push(t), t) }; return b; },
     },
     UrlFetchApp: { fetch: (url, opts) => { fetches.push({ url, opts }); return (fetch || (() => ({ code: 200, body: '{}' })))(url, opts); } },
     YouTube: Object.assign({ I18nLanguages: { list: () => ({ items: [] }) } }, yt.api),
@@ -235,7 +267,7 @@ function load({ bq = fakeBigQuery(), yt = fakeYouTube(), prompts = [], fetch } =
   const setting = key => { const sh = book.getSheetByName('Settings'); const row = sh.rows().find(r => r[0] === key); return row ? row[1] : undefined; };
   const setSetting = (key, v) => run(`writeSetting_(getSpreadsheet_(), ${JSON.stringify(key)}, ${JSON.stringify(v)})`);
   const reminders = () => triggers.filter(t => t.fn === 'sendExpiryReminder');
-  return { g, run, book, bq, yt, props, triggers, reminders, mails, alerts, fetches, logs, ui, setting, setSetting, lastAlert: () => alerts[alerts.length - 1] };
+  return { g, run, book, bq, yt, props, triggers, sleeps, reminders, mails, alerts, fetches, logs, ui, setting, setSetting, lastAlert: () => alerts[alerts.length - 1] };
 }
 
 /* ---------- tests ---------- */
@@ -274,7 +306,7 @@ test('manifest: advanced services, scopes and an anonymous web app', () => {
 test('onOpen adds the FocusFeed menu', () => {
   const env = load();
   env.run('onOpen()');
-  assert.deepEqual(env.ui.menu, ['setup', 'setGeminiApiKey', 'runCollect', 'checkSetup']);
+  assert.deepEqual(env.ui.menu, ['setup', 'setGeminiApiKey', 'runCollect', 'runScore', 'checkSetup']);
 });
 
 test('first Setup (sheets): asks for the topic, builds Settings + data tabs, removes empty Sheet1', () => {
@@ -681,4 +713,214 @@ test('checkSetup shows the schedule, last collect and units used today', () => {
   assert.match(msg, /✓ Daily collect scheduled \(around 14:00\)/);
   assert.match(msg, /✓ Last collect: .* UTC, ok, \d+ rows/);
   assert.match(msg, /YouTube units used today: \d+ of 10000/);
+});
+
+/* ---------- Score (pipeline step 2) ---------- */
+
+/**
+ * Gemini stand-in. Scores each item from the number in its title (v38 → 38 % 11 = 5), and
+ * can misbehave on chosen calls: { 3: '429', 4: 'daily', 5: '500', 6: 'garbage', 7: 'skip' }.
+ * `clock` advances a fake Date.now by the given ms per call (for time-limit tests).
+ */
+function fakeGemini({ on = {}, clock = 0, env } = {}) {
+  const gem = { calls: [] };
+  gem.fetch = (url, opts) => {
+    if (!/:generateContent$/.test(url)) return { code: 200, body: '{}' }; // key check
+    const body = JSON.parse(opts.payload);
+    const items = JSON.parse(body.contents[0].parts[0].text);
+    gem.calls.push({ url, opts, body, items });
+    if (clock && env) env.run(`__now += ${clock}`);
+    const mode = on[gem.calls.length];
+    const err = (code, message, details) => ({ code, body: JSON.stringify({ error: { code, message, details } }) });
+    if (mode === '429') { delete on[gem.calls.length]; return err(429, 'Resource exhausted', [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '7s' }]); }
+    if (mode === 'daily') return err(429, 'Quota exceeded: requests per day', [{ '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }] }]);
+    if (mode === '500') return err(503, 'The model is overloaded');
+    if (mode === 'badkey') return err(400, 'API key not valid. Please pass a valid API key.');
+    let answer = items.map(it => ({ id: it.id, score: Number(it.title.match(/v(\d+)/)[1]) % 11, reason: `about ${it.title.slice(-4)}` }));
+    if (mode === 'skip') { answer = answer.slice(1); answer[0].score = 99; answer.push({ id: '3', score: 0, reason: 'dup' }); } // drop id 1, id 2 out of range, duplicate id 3
+    const text = mode === 'garbage' ? 'Sure! Here are the scores:' : JSON.stringify(answer);
+    return { code: 200, body: JSON.stringify({ candidates: [{ content: { parts: [{ text }] }, finishReason: 'STOP' }], modelVersion: 'gemini-test-flash-001' }) };
+  };
+  return gem;
+}
+
+function scoreEnv({ storage = 'bigquery', gemini = {} } = {}) {
+  let gem;
+  const opts = { fetch: (u, o) => gem.fetch(u, o) };
+  const env = storage === 'bigquery' ? bigQueryEnv(opts) : load(Object.assign({ prompts: ['TOEFL'] }, opts));
+  gem = fakeGemini(Object.assign({ env }, gemini));
+  env.gem = gem;
+  env.run('setup()');
+  env.props.GEMINI_API_KEY = 'AIza-test';
+  env.run('runCollect()');
+  return env;
+}
+
+const feedEligible = rows => rows.filter(r => r.embeddable && r.duration_sec >= 1 && r.duration_sec <= 180);
+
+test('Setup schedules the daily score an hour after collect', () => {
+  const env = load({ prompts: ['TOEFL'] });
+  env.run('setup()');
+  env.setSetting('COLLECT_HOUR', 23);
+  env.run('setup()');
+  const daily = env.triggers.filter(t => t.fn === 'runScore');
+  assert.equal(daily.length, 1);
+  assert.equal(daily[0].atHour, 0, 'wraps past midnight');
+});
+
+test('score (bigquery): every feed-eligible video scored once, in batches of 25, saved and logged', () => {
+  const env = scoreEnv();
+  env.run('runScore()');
+  const eligible = feedEligible(env.bq.rows.raw_videos);
+  const scored = env.bq.rows.scored_videos;
+  assert.equal(scored.length, eligible.length);
+  assert.deepEqual(new Set(scored.map(s => s.video_id)), new Set(eligible.map(r => r.video_id)));
+  assert.equal(env.gem.calls.length, Math.ceil(eligible.length / 25));
+  env.gem.calls.forEach(c => {
+    assert.ok(c.items.length <= 25);
+    assert.deepEqual(c.items.map(i => i.id), c.items.map((_, i) => String(i + 1)), 'short numeric ids');
+    assert.equal(c.opts.headers['x-goog-api-key'], 'AIza-test');
+    assert.doesNotMatch(c.url, /AIza/);
+    assert.match(c.url, /models\/gemini-flash-latest:generateContent$/);
+    assert.equal(c.body.generationConfig.temperature, 0);
+    assert.equal(c.body.generationConfig.responseMimeType, 'application/json');
+    assert.equal(c.body.generationConfig.responseSchema.type, 'ARRAY');
+    assert.match(c.body.systemInstruction.parts[0].text, /learning "TOEFL"/);
+    c.items.forEach(i => assert.ok(i.description.length <= 300 && i.title.length <= 200));
+  });
+  const v38 = scored.find(s => s.video_id === 'v38');
+  assert.deepEqual([v38.score, v38.model, v38.prompt_version, v38.topic], [38 % 11, 'gemini-test-flash-001', 'v1', 'TOEFL']);
+  const log = env.bq.rows.pipeline_runs.filter(r => r.step === 'score');
+  assert.equal(log.length, 1);
+  assert.deepEqual([log[0].status, log[0].rows_in, log[0].rows_out, log[0].quota_units], ['ok', eligible.length, eligible.length, env.gem.calls.length]);
+  const msg = env.lastAlert().msg;
+  assert.match(env.lastAlert().title, /Score finished/);
+  assert.match(msg, new RegExp(`Scored ${eligible.length.toLocaleString('en-US')} videos in ${env.gem.calls.length} Gemini calls \\(gemini-test-flash-001\\)`));
+  assert.match(msg, /scored 7 or more \(MIN_SCORE\)/);
+  assert.match(msg, /Spread: 0–3: \d+ · 4–6: \d+ · 7–8: \d+ · 9–10: \d+/);
+  assert.match(msg, /Top: "Don't miss this v\d+" — 10: about/);
+  assert.equal(env.triggers.filter(t => t.fn === 'continueScore').length, 0, 'nothing left, no continuation');
+  assert.ok(env.bq.calls.includes('Jobs.getQueryResults'), 'polled until the query finished');
+
+  env.run('runScore()');
+  assert.match(env.lastAlert().msg, /Nothing new to score/);
+  assert.equal(env.bq.rows.scored_videos.length, eligible.length, 'second run scores nothing twice');
+});
+
+test('score: skipped or invalid answers are stored as unscored and not retried', () => {
+  const env = scoreEnv({ gemini: { on: { 2: 'skip', 4: 'garbage' } } });
+  env.run('runScore()');
+  const scored = env.bq.rows.scored_videos;
+  const nulls = scored.filter(s => s.score === null);
+  assert.equal(nulls.length, 2 + 25, 'a skipped id, an out-of-range score, and a whole unusable batch');
+  assert.ok(scored.every(s => s.score === null || (s.score >= 0 && s.score <= 10)), 'out-of-range 99 ignored');
+  const third = env.gem.calls[1].items[2];
+  const v3 = scored.find(s => s.video_id === `v${third.title.match(/v(\d+)/)[1]}`);
+  assert.equal(v3.reason, `about ${third.title.slice(-4)}`, 'first answer for a duplicated id wins');
+  assert.ok(nulls.some(s => /model skipped/.test(s.reason)));
+  assert.ok(nulls.some(s => /no usable score: Gemini returned malformed JSON/.test(s.reason)));
+  assert.match(env.lastAlert().msg, /27 videos got no usable score/);
+  const calls = env.gem.calls.length;
+  env.run('runScore()');
+  assert.equal(env.gem.calls.length, calls, 'unscorable videos are not sent again');
+});
+
+test('score: a 429 is retried after Gemini\'s retryDelay', () => {
+  const env = scoreEnv({ gemini: { on: { 3: '429' } } });
+  env.run('runScore()');
+  assert.ok(env.sleeps.includes(7500), `slept ${env.sleeps}`);
+  assert.equal(env.bq.rows.scored_videos.filter(s => s.score === null).length, 0);
+  assert.equal(env.bq.rows.scored_videos.length, feedEligible(env.bq.rows.raw_videos).length);
+});
+
+test('score: daily Gemini quota stops cleanly, keeps earlier batches, no continuation', () => {
+  const env = scoreEnv({ gemini: { on: { 3: 'daily' } } });
+  env.run('runScore()');
+  assert.equal(env.gem.calls.length, 3);
+  assert.equal(env.bq.rows.scored_videos.length, 50, 'first two batches saved');
+  assert.match(env.lastAlert().msg, /Gemini daily quota used up/);
+  assert.match(env.lastAlert().msg, /left for the next run/);
+  assert.equal(env.triggers.filter(t => t.fn === 'continueScore').length, 0);
+  assert.equal(env.bq.rows.pipeline_runs.find(r => r.step === 'score').rows_in, 50);
+});
+
+test('score: an overloaded model stops for now and continues a minute later', () => {
+  const env = scoreEnv({ gemini: { on: { 2: '500', 3: '500', 4: '500', 5: '500' } } });
+  env.run('runScore()');
+  assert.equal(env.bq.rows.scored_videos.length, 25);
+  assert.match(env.lastAlert().msg, /Gemini is busy \(The model is overloaded\)/);
+  const cont = env.triggers.filter(t => t.fn === 'continueScore');
+  assert.equal(cont.length, 1);
+  assert.equal(cont[0].after, 60000);
+  env.run('continueScore()');
+  assert.equal(env.triggers.filter(t => t.fn === 'continueScore').length, 0, 'continuation removes itself when done');
+  assert.equal(env.bq.rows.scored_videos.length, feedEligible(env.bq.rows.raw_videos).length);
+});
+
+test('score: running out of time saves progress and schedules one continuation', () => {
+  const env = scoreEnv({ gemini: { clock: 70 * 1000 } });
+  env.run('globalThis.__now = Date.now(); Date.now = () => globalThis.__now;');
+  env.run('runScore()');
+  const calls = env.gem.calls.length;
+  assert.ok(calls >= 3 && calls <= 5, `${calls} calls before the 4.5 min budget`);
+  assert.equal(env.bq.rows.scored_videos.length, calls * 25);
+  assert.match(env.lastAlert().msg, /left: continuing automatically in about a minute/);
+  assert.equal(env.triggers.filter(t => t.fn === 'continueScore').length, 1);
+});
+
+test('score: a rejected key fails the run, saves nothing, and is logged', () => {
+  const env = scoreEnv({ gemini: { on: { 1: 'badkey' } } });
+  env.run('runScore()');
+  assert.equal(env.lastAlert().title, 'Score failed');
+  assert.match(env.lastAlert().msg, /API key not valid/);
+  assert.equal(env.bq.rows.scored_videos, undefined);
+  const log = env.bq.rows.pipeline_runs.find(r => r.step === 'score');
+  assert.equal(log.status, 'error');
+  assert.equal(env.gem.calls.length, 1, 'no retries for a bad request');
+});
+
+test('score: no key saved gives a clear message', () => {
+  const env = scoreEnv();
+  delete env.props.GEMINI_API_KEY;
+  env.run('runScore()');
+  assert.match(env.lastAlert().msg, /No Gemini key saved yet/);
+  assert.equal(env.gem.calls.length, 0);
+});
+
+test('score (sheets): reads the raw_videos tab, appends to scored_videos, skips what is done', () => {
+  const env = scoreEnv({ storage: 'sheets' });
+  env.run('runScore()');
+  const raw = env.run('sheetsReadTable_(getSpreadsheet_(), "raw_videos")');
+  const scored = env.run('sheetsReadTable_(getSpreadsheet_(), "scored_videos")');
+  assert.equal(scored.length, feedEligible(raw).length);
+  assert.ok(scored.every(s => s.prompt_version === 'v1' && s.topic === 'TOEFL'));
+  const calls = env.gem.calls.length;
+  env.run('runScore()');
+  assert.equal(env.gem.calls.length, calls);
+  assert.match(env.lastAlert().msg, /Nothing new to score/);
+});
+
+test('score from a trigger rethrows so Apps Script emails the failure', () => {
+  const env = scoreEnv({ gemini: { on: { 1: 'badkey' } } });
+  env.g.SpreadsheetApp.getUi = () => { throw new Error('no ui'); };
+  assert.throws(() => env.run('runScore()'), /API key not valid/);
+});
+
+test('checkSetup shows both daily jobs and their last runs', () => {
+  const env = scoreEnv();
+  env.run('runScore()');
+  env.run('checkSetup()');
+  const msg = env.lastAlert().msg;
+  assert.match(msg, /✓ Daily collect scheduled \(around 14:00\)/);
+  assert.match(msg, /✓ Daily score scheduled \(around 15:00\)/);
+  assert.match(msg, /✓ Last score: .* UTC, ok, \d+ rows/);
+});
+
+test('score: a hard failure mid-run still saves the batches scored before it', () => {
+  const env = scoreEnv({ gemini: { on: { 3: 'badkey' } } });
+  env.run('runScore()');
+  assert.equal(env.lastAlert().title, 'Score failed');
+  assert.equal(env.bq.rows.scored_videos.length, 50);
+  const log = env.bq.rows.pipeline_runs.find(r => r.step === 'score');
+  assert.deepEqual([log.status, log.rows_out], ['error', 50]);
 });

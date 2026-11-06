@@ -5,6 +5,7 @@
  *                                      when STORAGE = bigquery. Safe to run again any time.
  *   FocusFeed → Set Gemini API key…    stores the key in Script Properties (never in the sheet)
  *   FocusFeed → Run collect now        pipeline step 1 on demand (it also runs daily)
+ *   FocusFeed → Run score now          pipeline step 2 on demand (daily, an hour after collect)
  *   FocusFeed → Check setup            read-only health check: account, settings, APIs, tables
  */
 const REMIND_DAYS_BEFORE_EXPIRY = 15; // sandbox tables live 60 days → reminder on day 45
@@ -17,6 +18,7 @@ function onOpen() {
     .addItem('Set Gemini API key…', 'setGeminiApiKey')
     .addSeparator()
     .addItem('Run collect now', 'runCollect')
+    .addItem('Run score now', 'runScore')
     .addSeparator()
     .addItem('Check setup', 'checkSetup')
     .addToUi();
@@ -92,6 +94,7 @@ function setupInner_() {
   }
 
   out.push(ensureDailyTrigger_('runCollect', cfg.COLLECT_HOUR, 'Daily collect'));
+  out.push(ensureDailyTrigger_('runScore', (cfg.COLLECT_HOUR + 1) % 24, 'Daily score'));
 
   if (!props.getProperty(GEMINI_KEY_PROP)) out.push('', 'Next: FocusFeed → Set Gemini API key…');
   tell_('FocusFeed setup done', out);
@@ -176,13 +179,16 @@ function checkSetup() {
     }
   }
 
-  const scheduled = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'runCollect');
-  out.push(scheduled ? `✓ Daily collect scheduled (around ${cfg ? cfg.COLLECT_HOUR : '?'}:00)` : '✗ Daily collect not scheduled — run Setup');
-  const last = lastRun_('collect');
-  if (last) {
-    out.push(`${last.status === 'ok' ? '✓' : '✗'} Last collect: ${String(last.at).slice(0, 16).replace('T', ' ')} UTC, ` +
-      `${last.status}, ${last.rows} rows${last.message ? ' — ' + last.message : ''}`);
-  }
+  const hour = cfg ? cfg.COLLECT_HOUR : null;
+  [['collect', 'runCollect', hour], ['score', 'runScore', hour === null ? null : (hour + 1) % 24]].forEach(([step, handler, h]) => {
+    const scheduled = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === handler);
+    out.push(scheduled ? `✓ Daily ${step} scheduled (around ${h}:00)` : `✗ Daily ${step} not scheduled — run Setup`);
+    const last = lastRun_(step);
+    if (last) {
+      out.push(`${last.status === 'ok' ? '✓' : '✗'} Last ${step}: ${String(last.at).slice(0, 16).replace('T', ' ')} UTC, ` +
+        `${last.status}, ${last.rows} rows${last.message ? ' — ' + last.message : ''}`);
+    }
+  });
   out.push(`YouTube units used today: ${ytUnitsUsedToday_()} of ${YT_DAILY_QUOTA}`);
 
   try {

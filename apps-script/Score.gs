@@ -1,0 +1,251 @@
+/**
+ * Score.gs — pipeline step 2.
+ *
+ * Picks videos from raw_videos that could reach the feed (embeddable, ≤ 3 minutes) and have
+ * no score yet for this topic and prompt version, asks Gemini to rate them 0-10 in batches
+ * of SCORE_BATCH_SIZE, and appends the results to scored_videos. Runs daily an hour after
+ * collect, or from FocusFeed → Run score now. If time runs out with videos left, it
+ * schedules itself to continue a minute later.
+ *
+ * Changing the prompt? Bump SCORE_PROMPT_VERSION: every video is then re-scored once.
+ */
+const SCORE_PROMPT_VERSION = 'v1';
+const SHORTS_MAX_SEC = 180;
+const SCORE_CANDIDATE_LIMIT = 2000;
+const SCORE_SCHEMA = {
+  type: 'ARRAY',
+  items: {
+    type: 'OBJECT',
+    properties: {
+      id: { type: 'STRING' },
+      score: { type: 'INTEGER' },
+      reason: { type: 'STRING' },
+    },
+    required: ['id', 'score', 'reason'],
+  },
+};
+
+function scoringPrompt_(topic) {
+  return [
+    `You curate a study feed of YouTube Shorts for someone learning "${topic}". They watch this feed instead of`,
+    'random Shorts, so only videos that genuinely help them learn should score high.',
+    '',
+    'Score each video from 0 to 10, judging only from its title, channel, description and length:',
+    `10  = teaches a specific, correct ${topic} skill, tip, strategy or worked example a learner can use right away`,
+    `7-9 = clearly about ${topic} and educational`,
+    '4-6 = loosely related or thin: generic advice, motivation, mostly an advert for a course or app, score reveals, vlogs',
+    `1-3 = mentions ${topic} but does not help anyone learn it`,
+    '0   = unrelated, clickbait or spam',
+    '',
+    'Do not reward hype, emojis or big claims. Reply with a JSON list holding one object per video:',
+    'its id, the score, and a reason of at most 12 words.',
+  ].join('\n');
+}
+
+/** Menu item and daily trigger. */
+function runScore() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return tell_('FocusFeed', 'Another FocusFeed job is running. Try again in a few minutes.');
+  let result;
+  try {
+    result = score_();
+  } catch (e) {
+    if (!ui_()) throw e;
+    return tell_('Score failed', ['✗ ' + e.message, '', 'Anything already scored was saved, and the run is logged in pipeline_runs.']);
+  } finally {
+    lock.releaseLock();
+  }
+  tell_('Score finished', scoreSummary_(result));
+}
+
+/** One-off trigger set by a run that ran out of time. */
+function continueScore() {
+  deleteTriggersFor_('continueScore');
+  runScore();
+}
+
+function score_() {
+  const ss = getSpreadsheet_();
+  const cfg = readSettings_(ss);
+  const problems = validateSettings_(cfg);
+  if (problems.length) throw new Error('Fix the Settings tab first: ' + problems.join(' '));
+  if (!PropertiesService.getScriptProperties().getProperty(GEMINI_KEY_PROP)) {
+    throw new Error('No Gemini key saved yet. Use FocusFeed → Set Gemini API key…');
+  }
+
+  const started = new Date();
+  const run = {
+    run_id: newRunId_(started), step: 'score', started_at: started.toISOString(), finished_at: null,
+    status: 'ok', rows_in: 0, rows_out: 0, quota_units: 0, message: '',
+  };
+  const stats = { total: 0, calls: 0, model: null, notes: [], stopped: null, titles: {}, rows: [] };
+  let failure = null;
+  try {
+    const cands = scoreCandidates_(cfg);
+    stats.total = cands.total;
+    cands.rows.forEach(v => { stats.titles[v.video_id] = v.title; });
+    const deadline = started.getTime() + STEP_TIME_BUDGET_MS;
+    for (let i = 0; i < cands.rows.length; i += cfg.SCORE_BATCH_SIZE) {
+      if (Date.now() > deadline) { stats.notes.push('stopped early: time limit'); break; }
+      const batch = cands.rows.slice(i, i + cfg.SCORE_BATCH_SIZE);
+      run.rows_in += batch.length;
+      try {
+        const res = scoreBatch_(cfg, run, batch, deadline);
+        stats.calls++;
+        run.quota_units++;
+        stats.model = res.model;
+        stats.rows = stats.rows.concat(res.rows);
+      } catch (e) {
+        if (e.kind === 'output') {
+          // Unusable answer for this batch: record it so these videos aren't retried forever.
+          stats.calls++;
+          run.quota_units++;
+          stats.rows = stats.rows.concat(batch.map(v => scoreRow_(cfg, run, v.video_id, null, 'no usable score: ' + e.message, cfg.GEMINI_MODEL)));
+          stats.notes.push(`one batch got no usable answer (${e.message})`);
+          continue;
+        }
+        run.rows_in -= batch.length;
+        if (e.kind === 'daily_quota') { stats.stopped = 'quota'; stats.notes.push('Gemini daily quota used up; the rest is scored on the next run'); break; }
+        if (e.kind === 'rate_limit' || e.kind === 'server') { stats.stopped = 'busy'; stats.notes.push(`Gemini is busy (${e.message}); stopping for now`); break; }
+        throw e; // bad key, bad model, bad request: nothing later will work either
+      }
+    }
+  } catch (e) {
+    failure = e;
+  }
+  // Save whatever was scored, even if the run failed part-way.
+  try {
+    run.rows_out = storeAppend_(cfg, 'scored_videos', stats.rows, run.run_id);
+  } catch (e) {
+    failure = failure || e;
+  }
+  run.status = failure ? 'error' : 'ok';
+  run.message = (failure ? failure.message + (stats.notes.length ? '; ' : '') : '') + stats.notes.join('; ');
+  run.message = run.message.slice(0, 1000);
+  run.finished_at = new Date().toISOString();
+  logRun_(cfg, run);
+  if (failure) throw failure;
+
+  stats.left = Math.max(0, stats.total - stats.rows.length);
+  stats.continuing = stats.left > 0 && stats.rows.length > 0 && stats.stopped !== 'quota';
+  if (stats.continuing) {
+    deleteTriggersFor_('continueScore');
+    ScriptApp.newTrigger('continueScore').timeBased().after(60 * 1000).create();
+  }
+  return Object.assign(stats, { run, storage: cfg.STORAGE, minScore: cfg.MIN_SCORE });
+}
+
+/** Candidates: newest first, at most SCORE_CANDIDATE_LIMIT, plus how many exist in total. */
+function scoreCandidates_(cfg) {
+  if (cfg.STORAGE === 'bigquery') {
+    const t = name => `\`${cfg.BQ_PROJECT_ID}.${cfg.BQ_DATASET}.${name}\``;
+    const rows = bqQuery_(cfg, scoreCandidatesSql_(t('raw_videos'), t('scored_videos')), {
+      topic: cfg.TOPIC, prompt_version: SCORE_PROMPT_VERSION, max_duration: SHORTS_MAX_SEC, max_rows: SCORE_CANDIDATE_LIMIT,
+    });
+    return { rows, total: rows.length ? rows[0].total_candidates : 0 };
+  }
+  const ss = getSpreadsheet_();
+  const done = {};
+  sheetsReadTable_(ss, 'scored_videos')
+    .filter(s => s.topic === cfg.TOPIC && s.prompt_version === SCORE_PROMPT_VERSION)
+    .forEach(s => { done[s.video_id] = true; });
+  const latest = {};
+  sheetsReadTable_(ss, 'raw_videos').filter(r => r.topic === cfg.TOPIC).forEach(r => {
+    const cur = latest[r.video_id];
+    if (!cur || r.collected_at > cur.collected_at) latest[r.video_id] = r;
+  });
+  const all = Object.keys(latest).map(k => latest[k])
+    .filter(r => r.embeddable === true && r.duration_sec >= 1 && r.duration_sec <= SHORTS_MAX_SEC && !done[r.video_id])
+    .sort((a, b) => (a.collected_at < b.collected_at ? 1 : a.collected_at > b.collected_at ? -1 : 0));
+  return { rows: all.slice(0, SCORE_CANDIDATE_LIMIT), total: all.length };
+}
+
+/** Latest raw row per video → feed-eligible → not yet scored with this prompt version. */
+function scoreCandidatesSql_(rawTable, scoredTable) {
+  return `-- focusfeed: score candidates
+SELECT video_id, title, description, channel_title, duration_sec, collected_at,
+  COUNT(*) OVER () AS total_candidates
+FROM (
+  SELECT video_id, title, description, channel_title, duration_sec, embeddable, collected_at,
+    ROW_NUMBER() OVER (PARTITION BY video_id ORDER BY collected_at DESC) AS rn
+  FROM ${rawTable}
+  WHERE topic = @topic
+)
+WHERE rn = 1
+  AND embeddable
+  AND duration_sec BETWEEN 1 AND @max_duration
+  AND video_id NOT IN (
+    SELECT video_id FROM ${scoredTable}
+    WHERE topic = @topic AND prompt_version = @prompt_version
+  )
+ORDER BY collected_at DESC, video_id
+LIMIT @max_rows`;
+}
+
+/** One Gemini call for up to SCORE_BATCH_SIZE videos. Short numeric IDs keep the model from mangling YouTube IDs. */
+function scoreBatch_(cfg, run, batch, deadline) {
+  const cut = (s, n) => String(s || '').slice(0, n);
+  const items = batch.map((v, i) => ({
+    id: String(i + 1),
+    title: cut(v.title, 200),
+    channel: cut(v.channel_title, 80),
+    description: cut(v.description, 300),
+    seconds: v.duration_sec,
+  }));
+  const res = geminiJson_({
+    model: cfg.GEMINI_MODEL,
+    system: scoringPrompt_(cfg.TOPIC),
+    user: JSON.stringify(items),
+    schema: SCORE_SCHEMA,
+    deadline,
+  });
+  if (!Array.isArray(res.data)) throw geminiError_('output', 'expected a JSON list');
+  const byId = {};
+  res.data.forEach(x => { if (x && x.id !== undefined && !byId[String(x.id)]) byId[String(x.id)] = x; });
+  const model = res.modelVersion || cfg.GEMINI_MODEL;
+  const rows = batch.map((v, i) => {
+    const x = byId[String(i + 1)];
+    const s = x ? Math.round(Number(x.score)) : NaN;
+    return Number.isFinite(s) && s >= 0 && s <= 10
+      ? scoreRow_(cfg, run, v.video_id, s, cut(x.reason, 200), model)
+      : scoreRow_(cfg, run, v.video_id, null, 'model skipped this video', model);
+  });
+  return { rows, model };
+}
+
+function scoreRow_(cfg, run, videoId, score, reason, model) {
+  return {
+    run_id: run.run_id,
+    scored_at: new Date().toISOString(),
+    topic: cfg.TOPIC,
+    video_id: videoId,
+    score,
+    reason,
+    model,
+    prompt_version: SCORE_PROMPT_VERSION,
+  };
+}
+
+function scoreSummary_(r) {
+  const n = x => Number(x).toLocaleString('en-US');
+  if (!r.total) return ['Nothing new to score. Run collect first, or wait for the next daily run.'];
+  const scored = r.rows.filter(x => x.score !== null);
+  const band = (lo, hi) => scored.filter(x => x.score >= lo && x.score <= hi).length;
+  const where = r.storage === 'bigquery' ? 'BigQuery scored_videos' : 'the scored_videos tab';
+  const lines = [
+    `✓ Scored ${n(scored.length)} videos in ${r.calls} Gemini calls (${r.model || 'Gemini'})`,
+    `✓ ${n(scored.filter(x => x.score >= r.minScore).length)} scored ${r.minScore} or more (MIN_SCORE): these can reach the feed`,
+    `Spread: 0–3: ${n(band(0, 3))} · 4–6: ${n(band(4, 6))} · 7–8: ${n(band(7, 8))} · 9–10: ${n(band(9, 10))}`,
+    `✓ ${n(r.run.rows_out)} rows written to ${where}`,
+  ];
+  const sorted = scored.slice().sort((a, b) => b.score - a.score);
+  const show = x => `"${String(r.titles[x.video_id] || x.video_id).slice(0, 70)}" — ${x.score}: ${x.reason}`;
+  if (sorted.length) lines.push('', 'Top: ' + show(sorted[0]));
+  if (sorted.length > 1) lines.push('Lowest: ' + show(sorted[sorted.length - 1]));
+  const skipped = r.rows.length - scored.length;
+  if (skipped) lines.push(`(${skipped} videos got no usable score and won't be retried)`);
+  if (r.left) lines.push('', r.continuing ? `${n(r.left)} left: continuing automatically in about a minute.` : `${n(r.left)} left for the next run.`);
+  if (r.notes.length) lines.push('⚠ ' + r.notes.join('\n⚠ '));
+  lines.push(`Run ID: ${r.run.run_id}`);
+  return lines;
+}

@@ -144,3 +144,54 @@ function bqLoadRows_(cfg, tableName, rows, runId) {
   }
   return Number(res.statistics && res.statistics.load && res.statistics.load.outputRows) || rows.length;
 }
+
+/**
+ * Runs a read-only standard-SQL query with named parameters (SELECTs are allowed in the
+ * sandbox; only DML is not). Returns rows as plain objects with numbers, booleans and ISO
+ * timestamps already converted.
+ */
+function bqQuery_(cfg, sql, params) {
+  const projectId = cfg.BQ_PROJECT_ID;
+  const request = {
+    query: sql,
+    useLegacySql: false,
+    parameterMode: 'NAMED',
+    queryParameters: Object.keys(params || {}).map(name => ({
+      name,
+      parameterType: { type: typeof params[name] === 'number' ? 'INT64' : typeof params[name] === 'boolean' ? 'BOOL' : 'STRING' },
+      parameterValue: { value: String(params[name]) },
+    })),
+    timeoutMs: 30000,
+    maxResults: 10000,
+  };
+  let res = BigQuery.Jobs.query(request, projectId);
+  const ref = res.jobReference;
+  const deadline = Date.now() + 2 * 60 * 1000;
+  while (!res.jobComplete) {
+    if (Date.now() > deadline) throw new Error(`BigQuery query ${ref.jobId} is still running after 2 minutes.`);
+    Utilities.sleep(1000);
+    res = BigQuery.Jobs.getQueryResults(projectId, ref.jobId, { location: ref.location, timeoutMs: 30000, maxResults: 10000 });
+  }
+  const fields = res.schema.fields;
+  let rows = (res.rows || []).map(r => bqRow_(fields, r));
+  let token = res.pageToken;
+  while (token) {
+    const page = BigQuery.Jobs.getQueryResults(projectId, ref.jobId, { location: ref.location, pageToken: token, maxResults: 10000 });
+    rows = rows.concat((page.rows || []).map(r => bqRow_(fields, r)));
+    token = page.pageToken;
+  }
+  return rows;
+}
+
+function bqRow_(fields, row) {
+  const out = {};
+  fields.forEach((f, i) => {
+    const v = row.f[i].v;
+    if (v === null || v === undefined) out[f.name] = null;
+    else if (f.type === 'INTEGER' || f.type === 'INT64' || f.type === 'FLOAT' || f.type === 'FLOAT64') out[f.name] = Number(v);
+    else if (f.type === 'BOOLEAN' || f.type === 'BOOL') out[f.name] = v === 'true' || v === true;
+    else if (f.type === 'TIMESTAMP') out[f.name] = new Date(Number(v) * 1000).toISOString();
+    else out[f.name] = v;
+  });
+  return out;
+}

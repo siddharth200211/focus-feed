@@ -4,7 +4,7 @@ A swipe feed of YouTube Shorts about **one topic you choose**, so scrolling beco
 
 Under the hood it's a small data pipeline. A daily job collects Shorts from the YouTube Data API, Gemini scores each one for relevance, and the results go through `raw → scored → feed` tables. A mobile web app serves the feed and logs what you watch or skip, and that feeds back into the pipeline. It runs entirely on free tiers, and anyone can run their own copy.
 
-> **Status: Phase 1, in progress.** Done so far: Settings tab, Setup menu (spreadsheet tabs or BigQuery tables), tests, GitHub → Apps Script deploys, and step 1 (daily collect). Next up: score, feed build, and the web app.
+> **Status: Phase 1, in progress.** Done so far: Settings tab, Setup menu (spreadsheet tabs or BigQuery tables), tests, GitHub → Apps Script deploys, step 1 (daily collect) and step 2 (Gemini scoring). Next up: feed build and the web app.
 
 ## How it works
 
@@ -23,7 +23,7 @@ flowchart LR
 | Step | What happens | Runs |
 |---|---|---|
 | 1. Collect | Searches YouTube for your topic (short, embeddable videos; the day's searches rotate through topic phrasings and sort orders) and fetches each video's duration, embeddability and stats. Stops early rather than exceed the daily quota | Daily trigger |
-| 2. Score | Gemini rates each video 0–10 for fit with the topic. Only embeddable videos scoring ≥ `MIN_SCORE` are kept | After collect |
+| 2. Score | Gemini rates each new feed-eligible video (embeddable, ≤ 3 min) 0–10 for how useful it is for learning the topic, 25 per call, with a one-line reason. Each video is scored once per prompt version; rate limits are retried, and a run that runs out of time continues itself a minute later | An hour after collect |
 | 3. Store | `raw_videos` → `scored_videos` → `feed`, plus `pipeline_runs` for monitoring | Each run |
 | 4. Show | Swipe UI with embedded players. Opens on a phone with no login | On demand |
 | 5. Learn | Watches and skips land in the `events` tab and get batch-loaded nightly | Nightly |
@@ -51,6 +51,7 @@ Both modes use one schema ([`Schema.gs`](apps-script/Schema.gs)), so switching m
 5. **(Optional) Use BigQuery.** In **Settings**, set `STORAGE` to `bigquery` and fill in `BQ_PROJECT_ID`, then run **Setup** again. It creates the dataset and tables.
 6. **Check it.** **FocusFeed → Check setup** shows which Google account the script runs as, and whether the settings, tabs or tables, YouTube API and Gemini key all work.
 7. **Collect.** Setup schedules the daily collect at `COLLECT_HOUR`. To fill the feed straight away, run **FocusFeed → Run collect now**: about a minute, roughly 5,000 YouTube units, and the result is a few hundred to a thousand-plus new rows in `raw_videos`.
+8. **Score.** Setup also schedules scoring an hour after collect. Run **FocusFeed → Run score now** to score straight away; the summary shows the score spread plus the best and worst video so you can judge the model's taste.
 
 > Keep the sheet, the script, the BigQuery project and the Gemini key on **one Google account**. Check setup shows which account the script runs as.
 
@@ -118,7 +119,9 @@ apps-script/
   BigQueryStore.gs  BigQuery backend (create, additive migrations, expiry status)
   Pipeline.gs       shared plumbing: run IDs, storage-agnostic appends, pipeline_runs log, YouTube quota budget
   Collect.gs        step 1: rotating searches → video details → raw_videos
-  Setup.gs          FocusFeed menu: Setup, Gemini key, Run collect now, Check setup, sandbox reminder
+  Gemini.gs         Gemini client: JSON-schema output, retries, rate-limit handling
+  Score.gs          step 2: unscored candidates → Gemini in batches → scored_videos
+  Setup.gs          FocusFeed menu: Setup, Gemini key, Run collect/score now, Check setup, sandbox reminder
 tests/gas.test.js   runs the real .gs files against in-memory fakes of Google services
 ```
 
