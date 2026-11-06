@@ -210,9 +210,10 @@ function fakeQueryJob(store, job, p) {
 
 function fakeFeedPage(store, p, prm) {
   assert.ok(Array.isArray(prm.exclude) && prm.exclude.length >= 1, 'exclude is a non-empty ARRAY<STRING>');
-  const skip = new Set(prm.exclude);
+  assert.ok(Array.isArray(prm.liked) && prm.liked.length >= 1, 'liked is a non-empty ARRAY<STRING>');
+  const skip = new Set(prm.exclude), love = new Set(prm.liked);
   const rows = (store.rows.feed || []).filter(v => v.topic === prm.topic && !skip.has(v.video_id))
-    .sort((a, b) => b.score - a.score || (a.video_id + prm.seed < b.video_id + prm.seed ? -1 : 1)).slice(0, prm.limit);
+    .sort((a, b) => (love.has(b.video_id) - love.has(a.video_id)) || b.score - a.score || (a.video_id + prm.seed < b.video_id + prm.seed ? -1 : 1)).slice(0, prm.limit);
   const fields = [['video_id', 'STRING'], ['title', 'STRING'], ['channel_title', 'STRING'], ['duration_sec', 'INTEGER'], ['score', 'INTEGER'], ['reason', 'STRING']];
   return { jobComplete: true, jobReference: { projectId: p, jobId: 'page', location: 'US' }, schema: { fields: fields.map(([name, type]) => ({ name, type })) },
     rows: rows.length ? rows.map(r => ({ f: fields.map(([n]) => ({ v: r[n] === null ? null : String(r[n]) })) })) : undefined };
@@ -1234,7 +1235,7 @@ test('getFeedPage (bigquery): 50 at a time, best first, skipping what this sessi
   assert.equal(p1.more, env.bq.rows.feed.length > 50);
   const scores = p1.videos.map(v => v.score);
   assert.deepEqual(scores, scores.slice().sort((a, b) => b - a), 'best first');
-  assert.deepEqual(Object.keys(p1.videos[0]).sort(), ['channel', 'id', 'reason', 'score', 'seconds', 'title']);
+  assert.deepEqual(Object.keys(p1.videos[0]).sort(), ['channel', 'id', 'liked', 'reason', 'score', 'seconds', 'title']);
   const p2 = env.run(`getFeedPage({ seed: "abc", exclude: ${JSON.stringify(p1.videos.map(v => v.id))} })`);
   assert.ok(p2.videos.every(v => !p1.videos.some(x => x.id === v.id)), 'no repeats in a session');
 });
@@ -1296,4 +1297,50 @@ test('checkSetup reports the last feed build and whether the web app is deployed
   env.webAppUrl.value = 'https://script.google.com/macros/s/ABC/exec';
   env.run('checkSetup()');
   assert.match(env.lastAlert().msg, /✓ Web app deployed/);
+});
+
+/* ---------- like / dislike ---------- */
+
+function signal(env, id, type) {
+  return env.run(`logEvents([{ video_id: '${id}', event_type: '${type}', watch_ms: 2000, position: 0, session_id: 'sess123456', at: new Date().toISOString() }])`);
+}
+
+for (const storage of ['bigquery', 'sheets']) {
+  test(`like/dislike (${storage}): a disliked video never comes back; undo restores it`, () => {
+    const env = feedEnv(storage);
+    const first = env.run('getFeedPage({ seed: "s" })').videos;
+    const gone = first[0].id;
+    assert.equal(signal(env, gone, 'dislike'), 1);
+    assert.ok(!env.run('getFeedPage({ seed: "s" })').videos.some(v => v.id === gone));
+    assert.ok(!env.run('getFeedPage({ seed: "s", includeSeen: true })').videos.some(v => v.id === gone), 'not even on replay');
+    signal(env, gone, 'undislike');
+    assert.ok(env.run('getFeedPage({ seed: "s" })').videos.some(v => v.id === gone), 'undo brings it back');
+  });
+
+  test(`like/dislike (${storage}): liked videos come first on replay and say so; unlike reverts`, () => {
+    const env = feedEnv(storage);
+    const all = env.run('getFeedPage({ seed: "s" })').videos;
+    const fav = all[all.length - 1].id; // the lowest-ranked one on the page
+    signal(env, fav, 'like');
+    signal(env, fav, 'watch');
+    assert.ok(!env.run('getFeedPage({ seed: "s" })').videos.some(v => v.id === fav), 'watched: hidden for now');
+    const replay = env.run('getFeedPage({ seed: "s", includeSeen: true })').videos;
+    assert.equal(replay[0].id, fav, 'liked first on replay');
+    assert.equal(replay[0].liked, true);
+    signal(env, fav, 'unlike');
+    const again = env.run('getFeedPage({ seed: "s", includeSeen: true })').videos;
+    assert.notEqual(again[0].id, fav);
+    assert.equal(again.find(v => v.id === fav).liked, false);
+  });
+}
+
+test('like/dislike: the latest signal wins regardless of the order rows were written', () => {
+  const env = feedEnv();
+  const id = env.run('getFeedPage({ seed: "s" })').videos[0].id;
+  const t = ms => new Date(Date.now() - ms).toISOString();
+  env.run(`logEvents([
+    { video_id: '${id}', event_type: 'undislike', session_id: 'sess123456', at: '${t(1000)}' },
+    { video_id: '${id}', event_type: 'dislike', session_id: 'sess123456', at: '${t(5000)}' },
+  ])`);
+  assert.ok(env.run('getFeedPage({ seed: "s" })').videos.some(v => v.id === id), 'undislike was later');
 });

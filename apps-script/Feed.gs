@@ -7,11 +7,12 @@
  * Runs after every score run, or from FocusFeed → Build feed now.
  *
  * Serve: doGet() returns the swipe page (Index.html). The page calls getFeedPage() for 50
- * videos at a time and logEvents() for what was watched or skipped.
+ * videos at a time and logEvents() for what was watched, skipped, liked or disliked.
+ * A disliked video never comes back; liked videos come first when replaying the feed.
  */
 const FEED_SEEN_DAYS = 14;
 const VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
-const EVENT_TYPES = ['watch', 'skip', 'error'];
+const EVENT_TYPES = ['watch', 'skip', 'error', 'like', 'unlike', 'dislike', 'undislike'];
 
 /* ---------- step 3: build ---------- */
 
@@ -127,7 +128,8 @@ function doGet() {
 
 /**
  * Called by the page: the next videos, best first (ties shuffled per session), skipping what
- * this session already loaded and what was watched or skipped in the last 14 days.
+ * this session already loaded, anything disliked, and (unless includeSeen) what was watched or
+ * skipped in the last 14 days. With includeSeen, liked videos come first.
  * req = { exclude: [videoId…], seed: string, includeSeen: boolean }
  */
 function getFeedPage(req) {
@@ -136,18 +138,22 @@ function getFeedPage(req) {
   const cfg = readSettings_(ss);
   const limit = Math.max(10, Math.min(200, cfg.FEED_PAGE_SIZE || 50));
   const seed = String(req.seed || 'seed').replace(/[^A-Za-z0-9]/g, '').slice(0, 24) || 'seed';
-  const exclude = cleanIds_(req.exclude).slice(0, 5000).concat(req.includeSeen ? [] : seenVideoIds_(ss));
+  const signals = viewerSignals_(ss);
+  const exclude = cleanIds_(req.exclude).slice(0, 5000).concat(signals.disliked, req.includeSeen ? [] : signals.seen);
+  const liked = req.includeSeen ? signals.liked : [];
   let videos;
   if (cfg.STORAGE === 'bigquery') {
     videos = bqQuery_(cfg, feedPageSql_(`\`${cfg.BQ_PROJECT_ID}.${cfg.BQ_DATASET}.feed\``), {
-      topic: cfg.TOPIC, exclude: exclude.concat(['-']), seed, limit,
+      topic: cfg.TOPIC, exclude: exclude.concat(['-']), liked: liked.concat(['-']), seed, limit,
     });
   } else {
-    const skip = {};
+    const skip = {}, love = {};
     exclude.forEach(id => { skip[id] = true; });
+    liked.forEach(id => { love[id] = 1; });
     videos = sheetsReadTable_(ss, 'feed')
       .filter(v => v.topic === cfg.TOPIC && !skip[v.video_id])
-      .sort((a, b) => (Number(b.score) - Number(a.score)) || (hashStr_(a.video_id + seed) - hashStr_(b.video_id + seed)))
+      .sort((a, b) => ((love[b.video_id] || 0) - (love[a.video_id] || 0)) || (Number(b.score) - Number(a.score)) ||
+        (hashStr_(a.video_id + seed) - hashStr_(b.video_id + seed)))
       .slice(0, limit);
   }
   return {
@@ -156,6 +162,7 @@ function getFeedPage(req) {
     videos: videos.map(v => ({
       id: v.video_id, title: v.title || '', channel: v.channel_title || '',
       seconds: Number(v.duration_sec) || 0, score: Number(v.score), reason: v.reason || '',
+      liked: signals.liked.indexOf(v.video_id) !== -1,
     })),
   };
 }
@@ -165,7 +172,7 @@ function feedPageSql_(feedTable) {
 SELECT video_id, title, channel_title, duration_sec, score, reason
 FROM ${feedTable}
 WHERE topic = @topic AND video_id NOT IN UNNEST(@exclude)
-ORDER BY score DESC, FARM_FINGERPRINT(CONCAT(video_id, @seed))
+ORDER BY video_id IN UNNEST(@liked) DESC, score DESC, FARM_FINGERPRINT(CONCAT(video_id, @seed))
 LIMIT @limit`;
 }
 
@@ -194,14 +201,23 @@ function logEvents(events) {
   return rows.length;
 }
 
-/** Videos watched or skipped in the last FEED_SEEN_DAYS days (from the events tab). */
-function seenVideoIds_(ss) {
+/**
+ * What the viewer told us, from the events tab: seen = watched or skipped in the last
+ * FEED_SEEN_DAYS days; liked / disliked = the latest like/unlike and dislike/undislike per video.
+ */
+function viewerSignals_(ss) {
   const since = Date.now() - FEED_SEEN_DAYS * DAY_MS;
-  const seen = {};
-  sheetsReadTable_(ss, 'events').forEach(e => {
-    if ((e.event_type === 'watch' || e.event_type === 'skip') && Date.parse(e.event_at) >= since) seen[e.video_id] = true;
-  });
-  return Object.keys(seen);
+  const seen = {}, like = {}, dislike = {};
+  sheetsReadTable_(ss, 'events')
+    .sort((a, b) => Date.parse(a.event_at) - Date.parse(b.event_at))
+    .forEach(e => {
+      const t = e.event_type;
+      if ((t === 'watch' || t === 'skip') && Date.parse(e.event_at) >= since) seen[e.video_id] = true;
+      if (t === 'like' || t === 'unlike') like[e.video_id] = t === 'like';
+      if (t === 'dislike' || t === 'undislike') dislike[e.video_id] = t === 'dislike';
+    });
+  const on = m => Object.keys(m).filter(k => m[k] === true);
+  return { seen: Object.keys(seen), liked: on(like), disliked: on(dislike) };
 }
 
 function cleanIds_(ids) {

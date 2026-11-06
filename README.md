@@ -62,7 +62,7 @@ Both modes use one schema ([`Schema.gs`](apps-script/Schema.gs)), so switching m
 3. Open the **/exec** link (or **FocusFeed → Open feed**) on your phone. No login is needed; the page reads the feed through your script.
 4. Optional: copy the **Deployment ID** into the GitHub variable `DEPLOYMENT_ID`, so every push to `main` updates the web app too.
 
-The page shows the best-scored videos first, one per screen, with Gemini's score and reason. Swipe up for the next one. What you watch (3 s or more) or skip is logged to the `events` tab, and those videos are hidden for 14 days.
+The page shows the best-scored videos first, one per screen, with Gemini's score and reason. Swipe up for the next one. What you watch (3 s or more) or skip is logged to the `events` tab, and those videos are hidden for 14 days. **Not for me** removes a video for good (with Undo); **Like** saves it, and liked videos come first when you replay the feed. Both are logged as events for the learning step.
 
 ## Settings
 

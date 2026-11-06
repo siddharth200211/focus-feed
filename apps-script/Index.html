@@ -17,7 +17,7 @@
   .stage { position: relative; height: 100%; width: min(100vw, calc(100dvh * 9 / 16)); background: #000; }
   .stage img { width: 100%; height: 100%; object-fit: cover; opacity: .9; }
   .stage .player, .stage iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
-  .meta { position: absolute; left: 0; right: 0; bottom: 0; padding: 72px 16px calc(64px + env(safe-area-inset-bottom));
+  .meta { position: absolute; left: 0; right: 0; bottom: 0; padding: 72px 76px calc(64px + env(safe-area-inset-bottom)) 16px;
     background: linear-gradient(transparent, rgba(0,0,0,.85)); pointer-events: none; transition: opacity .4s; }
   .playing .meta { opacity: 0; transition: opacity .6s 3s; } /* title fades 3 s into the video */
   .card.paused .meta { opacity: 1; transition: opacity .2s; } /* tap to pause: title comes back */
@@ -37,11 +37,30 @@
   button { font: inherit; font-weight: 650; color: #000; background: #fff; border: 0; border-radius: 999px; padding: 11px 20px; cursor: pointer; }
   .spinner { width: 28px; height: 28px; border-radius: 50%; border: 3px solid rgba(255,255,255,.2); border-top-color: #fff; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  /* like / dislike rail, Shorts-style, on the right above YouTube's controls */
+  .rail { position: absolute; right: 10px; bottom: calc(76px + env(safe-area-inset-bottom)); z-index: 3;
+    display: flex; flex-direction: column; gap: 14px; align-items: center; }
+  .act { display: flex; flex-direction: column; align-items: center; gap: 4px; background: none; padding: 0; color: #fff;
+    font-size: 11.5px; font-weight: 600; text-shadow: 0 1px 2px rgba(0,0,0,.6); border-radius: 0; }
+  .act .dot { width: 48px; height: 48px; border-radius: 50%; display: grid; place-items: center;
+    background: rgba(0,0,0,.42); backdrop-filter: blur(6px); transition: transform .12s, background .2s; }
+  .act:active .dot { transform: scale(.9); }
+  .act svg { width: 24px; height: 24px; fill: none; stroke: #fff; stroke-width: 2; stroke-linejoin: round; }
+  .act[aria-pressed="true"] .dot { background: #fff; }
+  .act[aria-pressed="true"] svg { fill: #000; stroke: #000; }
+  .act:focus-visible .dot { outline: 2px solid #fff; outline-offset: 3px; }
+  .card.disliked .stage, .card.disliked .bg { opacity: .35; }
+  #toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translate(-50%, 20px);
+    z-index: 6; display: flex; gap: 14px; align-items: center; padding: 10px 10px 10px 16px; border-radius: 999px;
+    background: rgba(32,32,32,.95); color: #fff; font-size: 14px; opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+  #toast button { padding: 6px 14px; font-size: 13px; }
   @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } .meta { transition: none; } }
 </style>
 </head>
 <body>
 <div id="top"><span>FocusFeed<span class="topic" id="topic"></span></span><span id="count"></span></div>
+<div id="toast" role="status" aria-live="polite"><span></span><button type="button">Undo</button></div>
 <main id="feed">
   <section class="card end" id="status"><div class="spinner" role="status" aria-label="Loading"></div></section>
 </main>
@@ -107,10 +126,80 @@
     card.appendChild(bg);
     card.appendChild(stage);
     card.appendChild(meta);
+    card.appendChild(rail(v, i));
     var status = document.getElementById('status');
     feed.insertBefore(card, status && status.parentNode === feed ? status : null);
     state.cards.push(card);
     observer.observe(card);
+  }
+
+  /* ---------- like / dislike ---------- */
+  var THUMB = 'M7 10v11H3V10h4zm2 11h8.3a2 2 0 0 0 2-1.6l1.4-7A2 2 0 0 0 18.7 10H14V5.5A2.5 2.5 0 0 0 11.5 3L9 10v11z';
+  function icon(flip) {
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    if (flip) svg.style.transform = 'rotate(180deg)';
+    var p = document.createElementNS(ns, 'path');
+    p.setAttribute('d', THUMB);
+    svg.appendChild(p);
+    return svg;
+  }
+  function actButton(label, flip, pressed) {
+    var b = el('button', 'act');
+    b.type = 'button';
+    b.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+    b.setAttribute('aria-label', label);
+    var dot = el('span', 'dot');
+    dot.appendChild(icon(flip));
+    b.appendChild(dot);
+    b.appendChild(el('span', null, label));
+    return b;
+  }
+  function rail(v, i) {
+    var r = el('div', 'rail');
+    var like = actButton('Like', false, v.liked);
+    var dislike = actButton('Not for me', true, false);
+    like.onclick = function () { toggleLike(i, like); };
+    dislike.onclick = function () { doDislike(i, dislike); };
+    r.appendChild(like);
+    r.appendChild(dislike);
+    return r;
+  }
+  function onScreen(i) { return i === state.active ? Date.now() - state.shownAt : 0; }
+  function toggleLike(i, btn) {
+    var v = state.videos[i];
+    v.liked = !v.liked;
+    btn.setAttribute('aria-pressed', v.liked ? 'true' : 'false');
+    track(v.id, v.liked ? 'like' : 'unlike', onScreen(i), i);
+    flush();
+  }
+  var toastTimer = null;
+  function doDislike(i, btn) {
+    var v = state.videos[i];
+    if (v.disliked) return;
+    v.disliked = true;
+    btn.setAttribute('aria-pressed', 'true');
+    state.cards[i].classList.add('disliked');
+    track(v.id, 'dislike', onScreen(i), i);
+    flush();
+    toast('Removed from your feed', function () {
+      v.disliked = false;
+      btn.setAttribute('aria-pressed', 'false');
+      state.cards[i].classList.remove('disliked');
+      track(v.id, 'undislike', 0, i);
+      flush();
+    });
+    setTimeout(function () { if (v.disliked && state.active === i) next(); }, 700);
+  }
+  function toast(text, undo) {
+    var t = document.getElementById('toast');
+    t.querySelector('span').textContent = text;
+    t.querySelector('button').onclick = function () { t.classList.remove('show'); undo(); };
+    t.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.classList.remove('show'); }, 4000);
   }
 
   function removeStatus() { var s = document.getElementById('status'); if (s && !s.dataset.keep) s.remove(); }
@@ -242,6 +331,9 @@
   document.addEventListener('keydown', function (e) {
     if (e.key === 'ArrowDown' || e.key === 'j') { e.preventDefault(); next(); }
     if (e.key === 'ArrowUp' || e.key === 'k') { e.preventDefault(); prev(); }
+    var c = state.cards[state.active];
+    if (c && e.key === 'l') c.querySelectorAll('.act')[0].click();
+    if (c && e.key === 'd') c.querySelectorAll('.act')[1].click();
   });
 
   window.__focusfeed = state; // for debugging in the browser console
