@@ -56,7 +56,7 @@ def dbt(path, *args, vars_=None):
            "--target-path", str(Path(path).with_suffix(".target")), "--log-path", str(Path(path).with_suffix(".logs"))]
     if vars_ is not None:
         cmd += ["--vars", json.dumps(vars_)]
-    out = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    out = subprocess.run(cmd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert out.returncode == 0, out.stdout[-4000:] + out.stderr[-2000:]
     return out.stdout
 

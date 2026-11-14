@@ -31,7 +31,7 @@ models:
     +labels: {app: focusfeed}
     staging:
       +materialized: view
-      +schema: staging      # → <dataset>_staging, so the main dataset keeps only what apps read
+      +schema: staging      # builds into <dataset>_staging, so the main dataset keeps only what apps read
     intermediate:
       +materialized: view
       +schema: staging

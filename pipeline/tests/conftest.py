@@ -10,7 +10,9 @@ HERE = Path(__file__).parent
 def gas(expr: str):
     """Evaluate a JavaScript expression against the real Apps Script files (needs node)."""
     # On stdin: an expression carrying table fixtures can be longer than one command-line argument may be.
-    out = subprocess.run(["node", str(HERE / "gas_eval.js")], input=expr, capture_output=True, text=True, check=True)
+    # UTF-8 both ways: Windows would otherwise use its own code page and garble emoji and Hindi.
+    out = subprocess.run(["node", str(HERE / "gas_eval.js")], input=expr, capture_output=True, text=True,
+                         encoding="utf-8", check=True)
     return json.loads(out.stdout) if out.stdout else None
 
 

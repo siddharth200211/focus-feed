@@ -1,5 +1,5 @@
 {#
-  Settings values (topic, prompt version, …) reach SQL as literals. They are escaped here, per
+  Settings values (topic, prompt version, ...) reach SQL as literals. They are escaped here, per
   warehouse, so a topic like "TOEFL's speaking" can't break or change a query.
 #}
 

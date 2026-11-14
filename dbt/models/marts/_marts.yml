@@ -21,7 +21,7 @@ models:
         description: Collection the title, duration and other details come from (the newest).
 
   - name: fct_events
-    description: Every web app event once (watch, skip, like, …), with the video's channel.
+    description: Every web app event once (watch, skip, like, ...), with the video's channel.
     columns:
       - name: event_id
         data_tests: [unique, not_null]
