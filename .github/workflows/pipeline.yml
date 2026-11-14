@@ -1,14 +1,16 @@
-# Phase 2 pipeline: Python jobs that collect and score into BigQuery, plus their tests.
+# Phase 2 pipeline: Python jobs that collect and score into BigQuery, then dbt builds the feed.
 #
-#  - every push / pull request touching pipeline/ or apps-script/: pytest, including the parity
-#    tests that keep Phase 1 (Apps Script) and Phase 2 (Python) in agreement
-#  - daily at 09:15 UTC (14:45 IST): collect, then score (score runs even if collect failed, so
-#    videos left over from earlier days still get scored)
+#  - every push / pull request touching pipeline/, dbt/ or apps-script/: pytest, including the
+#    parity tests that keep Phase 1 (Apps Script) and Phase 2 (Python + dbt) in agreement, and
+#    the dbt project run end to end on DuckDB
+#  - daily at 09:15 UTC (14:45 IST): collect, score, build (each runs even if the one before
+#    failed, so leftovers still get scored and the feed is rebuilt from what there is)
 #  - Actions → "Pipeline" → Run workflow: run one command by hand
 #      check   settings, keys, Gemini model names, BigQuery access
 #      setup   create the dataset and tables
 #      seed    copy Phase 1's raw_videos, scored_videos and events into an empty BQ_DATASET
-#      daily / collect / score
+#      daily / collect / score / build
+#      compare  Phase 1's feed against Phase 2's, before switching over
 #
 # Google sign-in is keyless (Workload Identity Federation): see docs/phase2-setup.md for the
 # variables and secrets. Without WIF_PROVIDER the scheduled jobs skip themselves.
@@ -17,9 +19,9 @@ name: Pipeline
 on:
   push:
     branches: [main]
-    paths: ['pipeline/**', 'apps-script/**', '.github/workflows/pipeline.yml']
+    paths: ['pipeline/**', 'dbt/**', 'apps-script/**', '.github/workflows/pipeline.yml']
   pull_request:
-    paths: ['pipeline/**', 'apps-script/**', '.github/workflows/pipeline.yml']
+    paths: ['pipeline/**', 'dbt/**', 'apps-script/**', '.github/workflows/pipeline.yml']
   schedule:
     - cron: '15 9 * * *'
   workflow_dispatch:
@@ -27,7 +29,7 @@ on:
       command:
         description: What to run
         type: choice
-        options: [check, setup, seed, daily, collect, score]
+        options: [check, setup, seed, daily, collect, score, build, compare]
         default: check
 
 permissions:
@@ -98,10 +100,10 @@ jobs:
       - name: Install
         id: install
         if: steps.cfg.outputs.ready == 'true'
-        run: pip install -e pipeline
+        run: pip install -e "pipeline[dbt]"
 
       - name: focusfeed ${{ env.COMMAND }}
-        if: steps.cfg.outputs.ready == 'true' && contains(fromJSON('["check", "setup", "seed"]'), env.COMMAND)
+        if: steps.cfg.outputs.ready == 'true' && contains(fromJSON('["check", "setup", "seed", "compare"]'), env.COMMAND)
         run: python -m focusfeed "$COMMAND"
 
       - name: Collect
@@ -113,3 +115,7 @@ jobs:
         # ${{ }} because the expression starts with "!"; !cancelled() = run even if collect failed
         if: ${{ !cancelled() && steps.install.outcome == 'success' && (env.COMMAND == 'daily' || env.COMMAND == 'score') }}
         run: python -m focusfeed score
+
+      - name: Build feed (dbt)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && (env.COMMAND == 'daily' || env.COMMAND == 'build') }}
+        run: python -m focusfeed build

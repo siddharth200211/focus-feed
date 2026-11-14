@@ -1,0 +1,23 @@
+# No secrets here. prod signs in with Application Default Credentials: Workload Identity
+# Federation in GitHub Actions, `gcloud auth application-default login` on a laptop.
+# `python -m focusfeed build` sets the FOCUSFEED_* variables from the Settings tab.
+focusfeed:
+  target: prod
+  outputs:
+    prod:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('FOCUSFEED_PROJECT', 'unset') }}"
+      dataset: "{{ env_var('FOCUSFEED_DATASET', 'focus_feed_v2') }}"
+      location: "{{ env_var('FOCUSFEED_LOCATION', 'US') }}"
+      threads: 4
+      priority: interactive
+      job_execution_timeout_seconds: 300
+      job_retries: 1
+      # Cost guard: any single query that would scan more than 1 GB fails instead of running.
+      # FocusFeed's queries scan a few MB.
+      maximum_bytes_billed: 1000000000
+    ci:
+      type: duckdb
+      path: "{{ env_var('FOCUSFEED_DUCKDB', 'target/ci.duckdb') }}"
+      threads: 1

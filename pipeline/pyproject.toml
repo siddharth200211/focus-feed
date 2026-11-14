@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "focusfeed"
 version = "2.0.0"
-description = "FocusFeed Phase 2: collect and score YouTube Shorts for one topic into BigQuery."
+description = "FocusFeed Phase 2: collect, score and build a feed of YouTube Shorts for one topic in BigQuery."
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
@@ -15,7 +15,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+# dbt builds the feed (python -m focusfeed build)
+dbt = ["dbt-core>=1.12,<1.13", "dbt-bigquery>=1.12,<1.13"]
+# tests run the dbt project on DuckDB, so CI needs no Google account
+dev = ["pytest>=8", "dbt-core>=1.12,<1.13", "dbt-duckdb>=1.11,<1.12"]
 
 [project.scripts]
 focusfeed = "focusfeed.__main__:main"

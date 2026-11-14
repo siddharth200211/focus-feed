@@ -1,0 +1,127 @@
+version: 2
+
+models:
+  - name: dim_videos
+    description: >
+      One row per video and topic with its newest YouTube details and when it was first and last
+      collected. Built incrementally from raw_videos.
+    data_tests:
+      - unique_combination:
+          arguments:
+            columns: [topic, video_id]
+    columns:
+      - name: video_id
+        description: YouTube video ID.
+        data_tests: [not_null]
+      - name: first_seen_at
+        description: First collection of this video.
+      - name: last_seen_at
+        description: Latest collection of this video.
+      - name: details_collected_at
+        description: Collection the title, duration and other details come from (the newest).
+
+  - name: fct_events
+    description: Every web app event once (watch, skip, like, …), with the video's channel.
+    columns:
+      - name: event_id
+        data_tests: [unique, not_null]
+
+  - name: feed
+    description: >
+      Videos ready to show: latest score >= MIN_SCORE and embeddable. Rebuilt in full from
+      scored_videos + raw_videos.
+    columns:
+      - name: video_id
+        data_tests: [unique, not_null]
+      - name: topic
+        data_tests: [not_null]
+      - name: score
+        description: Latest Gemini score (0-10) under the current scoring rules.
+        data_tests:
+          - not_null
+          - in_range:
+              arguments:
+                min_value: "{{ var('min_score') }}"
+                max_value: 10
+      - name: duration_sec
+        data_tests:
+          - in_range:
+              arguments:
+                min_value: 1
+                max_value: "{{ var('max_duration_sec') }}"
+      - name: first_seen_at
+        description: First collection of this video.
+      - name: built_at
+        description: When this feed snapshot was built.
+
+  - name: pipeline_daily
+    description: Pipeline health per day, phase and step (runs, failures, rows, API usage, duration).
+    data_tests:
+      - unique_combination:
+          arguments:
+            columns: [run_date, phase, step]
+
+unit_tests:
+  - name: feed_applies_the_settings_rules
+    description: Only videos that pass every rule in Settings reach the feed.
+    model: feed
+    overrides:
+      vars:
+        topic: TOEFL
+        min_score: 7
+        max_duration_sec: 180
+        min_published: "2025-01-01T00:00:00.000Z"
+        language: en
+    given:
+      - input: ref('dim_videos')
+        rows:
+          - {topic: TOEFL, video_id: ok_video___, title: Good, duration_sec: 45, embeddable: true, published_at: "2026-01-05 00:00:00", language: en-US, first_seen_at: "2026-11-01 08:00:00"}
+          - {topic: TOEFL, video_id: low_score__, title: Meh, duration_sec: 45, embeddable: true, published_at: "2026-01-05 00:00:00", language: en, first_seen_at: "2026-11-01 08:00:00"}
+          - {topic: TOEFL, video_id: too_long___, title: Long, duration_sec: 181, embeddable: true, published_at: "2026-01-05 00:00:00", language: en, first_seen_at: "2026-11-01 08:00:00"}
+          - {topic: TOEFL, video_id: no_embed___, title: Private, duration_sec: 30, embeddable: false, published_at: "2026-01-05 00:00:00", language: en, first_seen_at: "2026-11-01 08:00:00"}
+          - {topic: TOEFL, video_id: too_old____, title: Old, duration_sec: 30, embeddable: true, published_at: "2024-12-31 23:59:59", language: en, first_seen_at: "2026-11-01 08:00:00"}
+          - {topic: TOEFL, video_id: hindi______, title: Hindi, duration_sec: 30, embeddable: true, published_at: "2026-01-05 00:00:00", language: hi, first_seen_at: "2026-11-01 08:00:00"}
+          - {topic: TOEFL, video_id: no_lang____, title: Unknown language, duration_sec: 30, embeddable: true, published_at: null, language: null, first_seen_at: "2026-11-01 08:00:00"}
+          - {topic: IELTS, video_id: other_topic, title: IELTS, duration_sec: 30, embeddable: true, published_at: "2026-01-05 00:00:00", language: en, first_seen_at: "2026-11-01 08:00:00"}
+          - {topic: TOEFL, video_id: unscored___, title: Not scored yet, duration_sec: 30, embeddable: true, published_at: "2026-01-05 00:00:00", language: en, first_seen_at: "2026-11-01 08:00:00"}
+      - input: ref('int_latest_scores')
+        rows:
+          - {video_id: ok_video___, score: 9, reason: clear tip}
+          - {video_id: low_score__, score: 6, reason: thin}
+          - {video_id: too_long___, score: 9, reason: x}
+          - {video_id: no_embed___, score: 9, reason: x}
+          - {video_id: too_old____, score: 9, reason: x}
+          - {video_id: hindi______, score: 9, reason: x}
+          - {video_id: no_lang____, score: 7, reason: borderline}
+          - {video_id: other_topic, score: 9, reason: x}
+    expect:
+      rows:
+        - {video_id: ok_video___, topic: TOEFL, title: Good, score: 9, reason: clear tip}
+        - {video_id: no_lang____, topic: TOEFL, title: Unknown language, score: 7, reason: borderline}
+
+  - name: dim_videos_merges_new_collections
+    description: >
+      An incremental run keeps the earliest first_seen_at, takes details from the newest
+      collection, and only touches videos collected since the cut-off (newest minus lookback_days).
+    model: dim_videos
+    overrides:
+      macros:
+        is_incremental: true
+      vars:
+        lookback_days: 3
+    given:
+      - input: this
+        rows:
+          - {topic: TOEFL, video_id: seen_before, title: Old title, first_seen_at: "2026-10-01 08:00:00", last_seen_at: "2026-11-10 08:00:00"}
+          - {topic: TOEFL, video_id: untouched__, title: Stays, first_seen_at: "2026-10-01 08:00:00", last_seen_at: "2026-11-01 08:00:00"}
+      - input: ref('stg_raw_videos')
+        rows:
+          - {topic: TOEFL, video_id: seen_before, run_id: r1, title: Old title, collected_at: "2026-11-01 08:00:00"}
+          - {topic: TOEFL, video_id: seen_before, run_id: r2, title: New title, collected_at: "2026-11-12 08:00:00"}
+          - {topic: TOEFL, video_id: seen_before, run_id: r3, title: Newest title, collected_at: "2026-11-13 08:00:00"}
+          - {topic: TOEFL, video_id: brand_new__, run_id: r3, title: Fresh, collected_at: "2026-11-13 08:00:00"}
+          - {topic: TOEFL, video_id: untouched__, run_id: r0, title: Stays, collected_at: "2026-11-01 08:00:00"}
+    expect:
+      rows:
+        - {topic: TOEFL, video_id: seen_before, title: Newest title, first_seen_at: "2026-10-01 08:00:00", last_seen_at: "2026-11-13 08:00:00", details_collected_at: "2026-11-13 08:00:00"}
+        - {topic: TOEFL, video_id: brand_new__, title: Fresh, first_seen_at: "2026-11-13 08:00:00", last_seen_at: "2026-11-13 08:00:00", details_collected_at: "2026-11-13 08:00:00"}

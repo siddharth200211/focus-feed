@@ -1,0 +1,38 @@
+version: 2
+
+models:
+  - name: stg_raw_videos
+    description: Every collected row from raw_videos, plus which phase collected it.
+    columns:
+      - name: video_id
+        description: YouTube video ID.
+      - name: collected_by_python
+        description: True for rows from the Phase 2 Python job (run IDs start with "py-").
+
+  - name: stg_scored_videos
+    description: Every Gemini score from scored_videos, plus which phase scored it.
+    columns:
+      - name: score
+        description: 0-10 fit with the topic; null when the model gave no usable score.
+        data_tests:
+          - in_range:
+              arguments: {min_value: 0, max_value: 10}
+
+  - name: stg_events
+    description: Web app events, deduplicated on event_id.
+    columns:
+      - name: event_id
+        data_tests: [unique, not_null]
+      - name: event_type
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [watch, skip, error, like, unlike, dislike, undislike]
+
+  - name: stg_pipeline_runs
+    description: Every pipeline step run, with its phase and duration.
+    columns:
+      - name: phase
+        description: python (Phase 2, GitHub Actions) or apps_script (Phase 1).
+      - name: duration_sec
+        description: Seconds from start to finish; null while a run is unfinished.

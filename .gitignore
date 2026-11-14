@@ -16,3 +16,4 @@ __pycache__/
 .venv/
 dbt/target/
 dbt/logs/
+dbt/.user.yml

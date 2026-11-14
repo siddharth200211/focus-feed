@@ -1,0 +1,39 @@
+version: 2
+
+sources:
+  - name: focusfeed
+    description: >
+      Raw tables written by the pipeline (Python jobs in GitHub Actions, or the Apps Script) and
+      by the nightly events load. Append-only. They live in the target dataset itself
+      (BQ_DATASET), so the same project runs against focus_feed_v2 or focus_feed.
+    database: "{{ target.database }}"
+    schema: "{{ target.schema }}"
+    tables:
+      - name: raw_videos
+        description: Every video returned by a YouTube search, one row per video per collection run.
+        config:
+          loaded_at_field: collected_at
+          freshness:
+            warn_after: {count: 36, period: hour}
+            error_after: {count: 72, period: hour}
+        columns:
+          - name: video_id
+            data_tests: [not_null]
+          - name: collected_at
+            data_tests: [not_null]
+
+      - name: scored_videos
+        description: Gemini relevance scores, one row per video per scoring run.
+        config:
+          loaded_at_field: scored_at
+          freshness:
+            warn_after: {count: 72, period: hour}
+        columns:
+          - name: video_id
+            data_tests: [not_null]
+
+      - name: events
+        description: What the viewer did in the web app, loaded nightly from the events tab.
+
+      - name: pipeline_runs
+        description: One row per pipeline step run (both phases).

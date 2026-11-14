@@ -1,0 +1,10 @@
+version: 2
+
+models:
+  - name: int_latest_scores
+    description: >
+      Newest non-null score per video for the current topic and prompt version. Changing the
+      scoring rules in Settings changes prompt_version, so old scores drop out until re-scored.
+    columns:
+      - name: video_id
+        data_tests: [unique, not_null]

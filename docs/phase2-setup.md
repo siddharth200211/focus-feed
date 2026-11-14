@@ -110,7 +110,19 @@ Repo → **Actions → Pipeline → Run workflow**, pick a command, one at a tim
 3. **seed**: copies Phase 1's `raw_videos`, `scored_videos` and `events` into the new, empty tables (copy
    jobs are free). Both phases then start from the same history, so their feeds can be compared. It never
    overwrites a table that already has rows, so run it **before** the first collect.
-4. **daily**: collect, then score: what the schedule runs every day at 14:45 IST from now on.
+4. **daily**: collect, score, then build: what the schedule runs every day at 14:45 IST from now on.
+   **build** runs the dbt project in `dbt/`: it creates a `focus_feed_v2_staging` dataset for its
+   views, then builds `dim_videos`, `fct_events`, `pipeline_daily` and the `feed` table the web app
+   reads, and checks them (one row per video, scores in range, sources not stale). Any single query
+   that would scan more than 1 GB is refused, so a mistake can't run up a bill.
 
 The scoring rules come from the same Settings tab, so both phases use the same prompt version: a video
 scored by Phase 1 counts as scored for Phase 2.
+
+## 8. Compare the two phases
+
+After a few daily runs, **Run workflow → compare** prints how far Phase 1's feed (Apps Script, in
+`focus_feed`) and Phase 2's (dbt, in `focus_feed_v2`) agree, and how often the two phases gave the
+same video the same score. They won't match exactly: each phase asks Gemini separately about new
+videos, so a 6 in one and a 7 in the other moves a video across MIN_SCORE. When they agree well,
+the web app switches to Phase 2 (steps to follow).

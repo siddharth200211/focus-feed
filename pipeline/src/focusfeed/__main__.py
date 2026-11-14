@@ -1,4 +1,4 @@
-"""Command line: python -m focusfeed {check|setup|seed|collect|score} — what the GitHub Actions jobs run.
+"""Command line: python -m focusfeed {check|setup|seed|collect|score|build|compare} — what GitHub Actions runs.
 
 Environment: SHEET_ID, GCP_PROJECT_ID, BQ_DATASET (optional override), YOUTUBE_API_KEY, GEMINI_API_KEY.
 Google credentials come from the environment (Workload Identity Federation in GitHub Actions,
@@ -36,9 +36,9 @@ def make_store(cfg: dict):
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="focusfeed")
-    p.add_argument("command", choices=["check", "setup", "seed", "collect", "score"])
+    p.add_argument("command", choices=["check", "setup", "seed", "collect", "score", "build", "compare"])
     p.add_argument("--from", dest="source", default="",
-                   help="seed: dataset to copy from (default: BQ_DATASET in the Settings tab, i.e. Phase 1's)")
+                   help="seed / compare: Phase 1's dataset (default: BQ_DATASET in the Settings tab)")
     args = p.parse_args(argv)
 
     sheet = open_sheet()
@@ -69,10 +69,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "setup":
         print("\n".join(store.ensure()) or "Everything already exists.")
         return 0
+    phase1_dataset = args.source or config_mod.parse(raw, env={})["BQ_DATASET"]
     if args.command == "seed":
-        source = args.source or config_mod.parse(raw, env={})["BQ_DATASET"]
         store.ensure()
-        print("\n".join(store.seed_from(source)))
+        print("\n".join(store.seed_from(phase1_dataset)))
         return 0
     if args.command == "collect":
         from .collect import collect
@@ -92,6 +92,18 @@ def main(argv: list[str] | None = None) -> int:
         store.ensure()
         s = score(cfg, store, Gemini(os.environ.get("GEMINI_API_KEY", "")), events=lambda: sheet.table("events"))
         print("\n".join(summary(s)))
+        return 0
+    if args.command == "build":
+        from .build import build, summary as build_summary
+
+        store.ensure()
+        out = build(cfg, store)
+        print("\n".join(build_summary(out, cfg)))
+        return 1 if out["run"]["status"] == "error" else 0
+    if args.command == "compare":
+        from .compare import compare
+
+        print("\n".join(compare(cfg, store, phase1_dataset)))
         return 0
     return 1
 

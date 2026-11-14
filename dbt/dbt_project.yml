@@ -1,0 +1,43 @@
+# FocusFeed Phase 2: the transformations between the raw tables (written by the Python jobs and
+# the web app) and the feed the web app reads. Runs after collect + score in GitHub Actions:
+#   python -m focusfeed build      (passes the Settings tab in as vars, logs to pipeline_runs)
+name: focusfeed
+version: "2.0.0"
+config-version: 2
+profile: focusfeed
+require-dbt-version: [">=1.10.0", "<2.0.0"]
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+clean-targets: ["target", "logs"]
+
+flags:
+  send_anonymous_usage_stats: false
+
+# Filled in from the Settings tab by `python -m focusfeed build`; these defaults only matter
+# when dbt runs on its own (tests, docs).
+vars:
+  topic: ""
+  prompt_version: "v1"
+  min_score: 7
+  max_duration_sec: 180
+  min_published: "1970-01-01T00:00:00.000Z"
+  language: ""
+  lookback_days: 3          # incremental models re-read this many days to catch late rows
+
+models:
+  focusfeed:
+    +persist_docs: {relation: true, columns: true}
+    +labels: {app: focusfeed}
+    staging:
+      +materialized: view
+      +schema: staging      # → <dataset>_staging, so the main dataset keeps only what apps read
+    intermediate:
+      +materialized: view
+      +schema: staging
+    marts:
+      +materialized: table
+
+data_tests:
+  focusfeed:
+    +severity: error
