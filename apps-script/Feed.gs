@@ -129,10 +129,21 @@ function buildFeedRows_(cfg, raw, scored, now) {
 
 /* ---------- step 4: serve ---------- */
 
+// The app icon (browser tab and Android "Add to Home screen"). It lives in the public repo;
+// set APP_ICON_URL in Settings to use your own PNG (square, 512×512 works best).
+const APP_ICON_DEFAULT = 'https://raw.githubusercontent.com/siddharth200211/focus-feed/main/assets/icon-512.png';
+// The only meta tags Apps Script allows (others are rejected).
+const ALLOWED_META_TAGS = ['apple-mobile-web-app-capable', 'google-site-verification', 'mobile-web-app-capable', 'viewport'];
+
 function doGet() {
+  let icon = APP_ICON_DEFAULT;
+  try { icon = readSettings_(getSpreadsheet_()).APP_ICON_URL || APP_ICON_DEFAULT; } catch (e) { /* settings unreadable: keep default */ }
   return HtmlService.createHtmlOutputFromFile('Index')
     .setTitle('FocusFeed')
-    .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover');
+    .setFaviconUrl(icon)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover')
+    .addMetaTag('mobile-web-app-capable', 'yes')        // home-screen launch without the browser bar
+    .addMetaTag('apple-mobile-web-app-capable', 'yes');
 }
 
 /**

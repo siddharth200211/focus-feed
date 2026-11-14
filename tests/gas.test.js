@@ -12,6 +12,8 @@ const vm = require('vm');
 const DIR = path.join(__dirname, '..', 'apps-script');
 const FILES = fs.readdirSync(DIR).filter(f => f.endsWith('.gs')).sort();
 const DAY = 24 * 60 * 60 * 1000;
+// Apps Script's HtmlOutput.addMetaTag only accepts these names.
+const ALLOWED_META = ['apple-mobile-web-app-capable', 'google-site-verification', 'mobile-web-app-capable', 'viewport'];
 
 /* ---------- fakes ---------- */
 
@@ -316,7 +318,7 @@ function load({ bq = fakeBigQuery(), yt = fakeYouTube(), prompts = [], fetch } =
       newTrigger: fn => { const t = { fn, getHandlerFunction: () => fn }; const b = { timeBased: () => b, at: d => (t.at = d, b), everyDays: n => (t.everyDays = n, b), atHour: h => (t.atHour = h, b), after: ms => (t.after = ms, b), create: () => (triggers.push(t), t) }; return b; },
     },
     HtmlService: {
-      createHtmlOutputFromFile: name => { const o = { name, meta: {}, setTitle: t => (o.title = t, o), addMetaTag: (k, v) => (o.meta[k] = v, o), getContent: () => fs.readFileSync(path.join(DIR, name + '.html'), 'utf8') }; return o; },
+      createHtmlOutputFromFile: name => { const o = { name, meta: {}, setTitle: t => (o.title = t, o), setFaviconUrl: u => (o.favicon = u, o), addMetaTag: (k, v) => { assert.ok(ALLOWED_META.includes(k), `Apps Script rejects meta tag ${k}`); o.meta[k] = v; return o; }, getContent: () => fs.readFileSync(path.join(DIR, name + '.html'), 'utf8') }; return o; },
       createHtmlOutput: html => { const o = { html, setWidth: () => o, setHeight: () => o }; return o; },
     },
     UrlFetchApp: { fetch: (url, opts) => { fetches.push({ url, opts }); return (fetch || (() => ({ code: 200, body: '{}' })))(url, opts); } },
@@ -1610,4 +1612,34 @@ test('limit: a run that is late hands the feed rebuild to its own job a minute l
   env.run('continueBuildFeed()');
   assert.ok(env.bq.rows.feed.length > 0);
   assert.equal(env.triggers.filter(x => x.fn === 'continueBuildFeed').length, 0, 'the one-off trigger removes itself');
+});
+
+/* ---------- app icon ---------- */
+
+test('web app: the FocusFeed logo is the page icon, and only allowed meta tags are used', () => {
+  const env = load({ prompts: ['TOEFL'] });
+  env.run('setup()');
+  const out = env.g.doGet({ parameter: {} });
+  assert.equal(out.favicon, 'https://raw.githubusercontent.com/siddharth200211/focus-feed/main/assets/icon-512.png');
+  assert.equal(out.meta['mobile-web-app-capable'], 'yes');
+  assert.equal(out.meta['apple-mobile-web-app-capable'], 'yes');
+  env.setSetting('APP_ICON_URL', 'https://example.com/my-icon.png');
+  assert.equal(env.g.doGet({ parameter: {} }).favicon, 'https://example.com/my-icon.png');
+  env.setSetting('APP_ICON_URL', 'ftp://nope');
+  env.run('setup()');
+  assert.match(env.lastAlert().msg, /APP_ICON_URL "ftp:\/\/nope" doesn't look right/);
+});
+
+test('web app: the page still opens with the default logo if Settings cannot be read', () => {
+  const env = load();
+  const out = env.g.doGet({ parameter: {} });
+  assert.match(out.favicon, /assets\/icon-512\.png$/);
+});
+
+test('app icon files exist and the PNG is a real 512×512 image', () => {
+  const png = fs.readFileSync(path.join(__dirname, '..', 'assets', 'icon-512.png'));
+  assert.equal(png.toString('ascii', 1, 4), 'PNG');
+  assert.equal(png.readUInt32BE(16), 512);
+  assert.equal(png.readUInt32BE(20), 512);
+  assert.ok(png.length < 100 * 1024, 'small enough to load fast');
 });

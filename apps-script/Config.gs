@@ -34,6 +34,8 @@ const SETTINGS = [
     note: 'Gemini model used for scoring. The default alias follows the newest Flash model; put a specific model name here to pin one.' },
   { key: 'GEMINI_FALLBACK_MODELS', def: 'gemini-flash-lite-latest', type: 'list',
     note: 'Tried in order when GEMINI_MODEL is overloaded, rate-limited, out of daily quota or not found (free-tier limits are per model). Comma-separated; "none" turns fallback off. Check setup shows which names work.' },
+  { key: 'APP_ICON_URL', def: '', type: 'string', pattern: /^(https:\/\/\S+)?$/,
+    note: 'Optional. Public https link to a square PNG used as the web app icon (browser tab, Android home screen). Blank = the FocusFeed logo.' },
   { key: 'FEED_PAGE_SIZE', def: 50, type: 'int', min: 10, max: 200,
     note: 'How many videos the web app loads at a time.' },
   { key: 'STORAGE', def: 'sheets', type: 'enum', options: ['sheets', 'bigquery'],

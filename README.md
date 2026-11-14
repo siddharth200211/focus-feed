@@ -61,6 +61,7 @@ Both modes use one schema ([`Schema.gs`](apps-script/Schema.gs)), so switching m
 2. *Execute as:* **Me** · *Who has access:* **Anyone** → **Deploy**, and approve the permissions.
 3. Open the **/exec** link (or **FocusFeed → Open feed**) on your phone. No login is needed; the page reads the feed through your script.
 4. Optional: copy the **Deployment ID** into the GitHub variable `DEPLOYMENT_ID`, so every push to `main` updates the web app too.
+5. **Add to Home screen** (Android Chrome: ⋮ → Add to Home screen) gives you the FocusFeed logo ([`assets/icon-512.png`](assets/icon-512.png)) and opens full-screen. To use your own logo, put a public https link to a square PNG in `APP_ICON_URL`. iPhones ignore page icons that Apps Script can set, so iOS shows a generic tile.
 
 The page shows the best-scored videos first, one per screen, with Gemini's score and reason. Swipe up for the next one. What you watch (3 s or more) or skip is logged to the `events` tab, and those videos are hidden for 14 days. **Not for me** removes a video for good (with Undo); **Like** saves it, and liked videos come first when you replay the feed. Both are logged as events for the learning step.
 
