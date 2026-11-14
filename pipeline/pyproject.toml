@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "focusfeed"
+version = "2.0.0"
+description = "FocusFeed Phase 2: collect and score YouTube Shorts for one topic into BigQuery."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "google-cloud-bigquery>=3.40,<4",
+  "google-auth>=2.30,<3",
+  "requests>=2.32,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+focusfeed = "focusfeed.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

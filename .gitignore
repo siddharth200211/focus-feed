@@ -9,3 +9,10 @@ node_modules/
 .DS_Store
 # files the Claude app saves into this folder (previews, downloads)
 Claude outputs/
+# Python (Phase 2 pipeline)
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+dbt/target/
+dbt/logs/
