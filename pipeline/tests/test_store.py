@@ -118,3 +118,27 @@ def test_seed_refuses_to_copy_a_dataset_onto_itself():
     s, _ = make()
     with pytest.raises(ValueError):
         s.seed_from("focus_feed_v2")
+
+
+class DmlJob:
+    def __init__(self, n):
+        self.num_dml_affected_rows = n
+
+    def result(self, timeout=None):
+        return []
+
+
+def test_adopt_copies_only_phase_2_runs_not_already_there():
+    s, c = make()
+    s.dataset = "focus_feed"
+    sql_seen = []
+    c.query = lambda sql, job_config: sql_seen.append(sql) or DmlJob(7)
+    out = s.adopt_from("focus_feed_v2")
+    assert out == [f"{t}: 7 Phase 2 rows copied from focus_feed_v2" for t in ("raw_videos", "scored_videos", "pipeline_runs")]
+    raw = sql_seen[0]
+    cols = ", ".join(f[0] for f in TABLES["raw_videos"]["fields"])
+    assert f"INSERT INTO `p.focus_feed.raw_videos` ({cols})" in raw
+    assert f"SELECT {cols} FROM `p.focus_feed_v2.raw_videos`" in raw
+    assert "STARTS_WITH(run_id, 'py-')" in raw and "run_id NOT IN (SELECT DISTINCT run_id FROM `p.focus_feed.raw_videos`" in raw
+    with pytest.raises(ValueError):
+        s.adopt_from("focus_feed")

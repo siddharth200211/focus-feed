@@ -1643,3 +1643,50 @@ test('app icon files exist and the PNG is a real 512×512 image', () => {
   assert.equal(png.readUInt32BE(20), 512);
   assert.ok(png.length < 100 * 1024, 'small enough to load fast');
 });
+
+/* ---------- handover to Phase 2 (PIPELINE = github) ---------- */
+
+test('handover: PIPELINE = github turns off collect and score here, keeps the web app and the nightly events load', () => {
+  const env = scoreEnv();
+  env.run('runScore()');
+  assert.equal(env.setting('PIPELINE'), 'apps_script', 'Setup adds the new setting with the safe default');
+  env.setSetting('PIPELINE', 'github');
+  env.run('setup()');
+  const fns = env.triggers.map(t => t.fn);
+  ['runCollect', 'runScore', 'continueScore', 'continueBuildFeed'].forEach(f => assert.ok(!fns.includes(f), `${f} removed`));
+  assert.ok(fns.includes('runLoadEvents'), 'the nightly events load stays');
+  assert.match(env.lastAlert().msg, /run in GitHub Actions \(PIPELINE = github\): this script's daily collect and score are off/);
+
+  const jobs = env.bq.calls.length;
+  ['runCollect()', 'runScore()', 'runBuildFeed()', 'continueScore()', 'continueBuildFeed()'].forEach(call => {
+    env.run(call);
+    assert.match(env.lastAlert().msg, /runs in GitHub Actions now \(PIPELINE = github in Settings\), so nothing ran here/, call);
+  });
+  assert.equal(env.bq.calls.length, jobs, 'no BigQuery calls from the turned-off steps');
+  const page = env.run('getFeedPage({ seed: "abc" })');
+  assert.ok(page.videos.length > 0, 'the web app still serves the feed');
+});
+
+test('handover: checkSetup says who runs the pipeline, and flags triggers left behind', () => {
+  const env = scoreEnv();
+  env.setSetting('PIPELINE', 'github');
+  env.run('checkSetup()');
+  assert.match(env.lastAlert().msg, /✗ PIPELINE = github but this script still collects and scores daily — run Setup/);
+  env.run('setup()');
+  env.run('checkSetup()');
+  const msg = env.lastAlert().msg;
+  assert.match(msg, /✓ Collect, score and the feed build run in GitHub Actions \(PIPELINE = github\)/);
+  assert.doesNotMatch(msg, /Daily collect not scheduled|Daily score not scheduled/);
+});
+
+test('handover: switching back to apps_script and running Setup brings the daily jobs back', () => {
+  const env = scoreEnv();
+  env.setSetting('PIPELINE', 'github');
+  env.run('setup()');
+  env.setSetting('PIPELINE', 'apps_script');
+  env.run('setup()');
+  assert.equal(env.triggers.filter(t => t.fn === 'runCollect').length, 1);
+  assert.equal(env.triggers.filter(t => t.fn === 'runScore').length, 1);
+  env.run('runCollect()');
+  assert.match(env.lastAlert().title, /Collect finished/);
+});

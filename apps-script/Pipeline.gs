@@ -71,3 +71,15 @@ function ytSpend_(units) {
     .filter(k => k.indexOf('YT_UNITS_') === 0 && k !== key)
     .forEach(k => props.deleteProperty(k)); // old days
 }
+
+/**
+ * True when Phase 2 (GitHub Actions) runs the pipeline (PIPELINE = github), so this script must
+ * not collect, score or rebuild the feed as well. Tells the user when they clicked the menu.
+ */
+function runsInGithub_(step) {
+  const cfg = safeSettings_();
+  if (cfg.PIPELINE !== 'github') return false;
+  tell_('FocusFeed', [`${step} runs in GitHub Actions now (PIPELINE = github in Settings), so nothing ran here.`,
+    'Run it from GitHub → Actions → Pipeline → Run workflow, or set PIPELINE back to apps_script and run Setup.']);
+  return true;
+}

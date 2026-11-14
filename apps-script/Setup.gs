@@ -10,6 +10,9 @@
  *   FocusFeed → Load events now        step 5: events tab → BigQuery (also runs nightly)
  *   FocusFeed → Open feed              link to the web app (step 4)
  *   FocusFeed → Check setup            read-only health check: account, settings, APIs, tables
+ *
+ * With PIPELINE = github in Settings, collect, score and the feed build run in GitHub Actions
+ * (Phase 2) instead: Setup removes their triggers and the three "Run … now" items only explain that.
  */
 const REMIND_DAYS_BEFORE_EXPIRY = 15; // sandbox tables live 60 days → reminder on day 45
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -99,8 +102,13 @@ function setupInner_() {
     out.push(applyExpiryStatus_(ss, bq.expiry));
   }
 
-  out.push(ensureDailyTrigger_('runCollect', cfg.COLLECT_HOUR, 'Daily collect'));
-  out.push(ensureDailyTrigger_('runScore', (cfg.COLLECT_HOUR + 1) % 24, 'Daily score'));
+  if (cfg.PIPELINE === 'github') {
+    ['runCollect', 'runScore', 'continueScore', 'continueBuildFeed'].forEach(deleteTriggersFor_);
+    out.push('✓ Collect, score and the feed build run in GitHub Actions (PIPELINE = github): this script\'s daily collect and score are off');
+  } else {
+    out.push(ensureDailyTrigger_('runCollect', cfg.COLLECT_HOUR, 'Daily collect'));
+    out.push(ensureDailyTrigger_('runScore', (cfg.COLLECT_HOUR + 1) % 24, 'Daily score'));
+  }
   if (cfg.STORAGE === 'bigquery') out.push(ensureDailyTrigger_('runLoadEvents', EVENTS_LOAD_HOUR, 'Nightly events load'));
   else deleteTriggersFor_('runLoadEvents');
 
@@ -189,7 +197,14 @@ function checkSetup() {
   }
 
   const hour = cfg ? cfg.COLLECT_HOUR : null;
-  [['collect', 'runCollect', hour], ['score', 'runScore', hour === null ? null : (hour + 1) % 24]].forEach(([step, handler, h]) => {
+  const github = cfg && cfg.PIPELINE === 'github';
+  if (github) {
+    const leftover = ScriptApp.getProjectTriggers().some(t => ['runCollect', 'runScore'].indexOf(t.getHandlerFunction()) !== -1);
+    out.push(leftover
+      ? '✗ PIPELINE = github but this script still collects and scores daily — run Setup'
+      : '✓ Collect, score and the feed build run in GitHub Actions (PIPELINE = github); see Actions → Pipeline for their runs');
+  }
+  if (!github) [['collect', 'runCollect', hour], ['score', 'runScore', hour === null ? null : (hour + 1) % 24]].forEach(([step, handler, h]) => {
     const scheduled = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === handler);
     out.push(scheduled ? `✓ Daily ${step} scheduled (around ${h}:00)` : `✗ Daily ${step} not scheduled — run Setup`);
     const last = lastRun_(step);

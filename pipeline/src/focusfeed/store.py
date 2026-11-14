@@ -70,6 +70,10 @@ class BigQueryStore:
         return int(job.output_rows or len(rows))
 
     def query(self, sql: str, params: dict | None = None) -> list[dict]:
+        job = self.client.query(sql, job_config=self.bq.QueryJobConfig(query_parameters=self._params(params)))
+        return [dict(r.items()) for r in job.result(timeout=300)]
+
+    def _params(self, params: dict | None) -> list:
         qp = []
         for name, v in (params or {}).items():
             if isinstance(v, list):
@@ -80,8 +84,32 @@ class BigQueryStore:
                 qp.append(self.bq.ScalarQueryParameter(name, "INT64", v))
             else:
                 qp.append(self.bq.ScalarQueryParameter(name, "STRING", str(v)))
-        job = self.client.query(sql, job_config=self.bq.QueryJobConfig(query_parameters=qp))
-        return [dict(r.items()) for r in job.result(timeout=300)]
+        return qp
+
+    def execute(self, sql: str, params: dict | None = None) -> int:
+        """A DML statement (INSERT …); returns the rows it changed."""
+        job = self.client.query(sql, job_config=self.bq.QueryJobConfig(query_parameters=self._params(params)))
+        job.result(timeout=300)
+        return int(job.num_dml_affected_rows or 0)
+
+    def adopt_from(self, source_dataset: str, tables=("raw_videos", "scored_videos", "pipeline_runs")) -> list[str]:
+        """Switch-over: copies the rows Phase 2 wrote while it ran beside Phase 1 ("py-" run IDs) from
+        its own dataset into this one. Runs already here are skipped, so it is safe to repeat."""
+        from .schema import column_names
+
+        if source_dataset == self.dataset:
+            raise ValueError(f"Source and target are both {self.dataset}: nothing to adopt.")
+        out = []
+        for name in tables:
+            cols = ", ".join(column_names(name))
+            n = self.execute(
+                f"-- focusfeed: adopt {name}\n"
+                f"INSERT INTO `{self.ref(name)}` ({cols})\n"
+                f"SELECT {cols} FROM `{self.project}.{source_dataset}.{name}`\n"
+                f"WHERE STARTS_WITH(run_id, 'py-')\n"
+                f"  AND run_id NOT IN (SELECT DISTINCT run_id FROM `{self.ref(name)}` WHERE STARTS_WITH(run_id, 'py-'))")
+            out.append(f"{name}: {n:,} Phase 2 rows copied from {source_dataset}")
+        return out
 
     def seed_from(self, source_dataset: str, tables=("raw_videos", "scored_videos", "events")) -> list[str]:
         """Copies Phase 1's history into this (empty) dataset with copy jobs, which are free, so both

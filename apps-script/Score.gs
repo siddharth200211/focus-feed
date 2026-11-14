@@ -65,6 +65,7 @@ function scoringPrompt_(topic, taste, rules) {
 
 /** Menu item and daily trigger. */
 function runScore() {
+  if (runsInGithub_('Score')) return;
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) return tell_('FocusFeed', 'Another FocusFeed job is running. Try again in a few minutes.');
   let result;

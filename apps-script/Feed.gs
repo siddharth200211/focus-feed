@@ -17,6 +17,7 @@ const EVENT_TYPES = ['watch', 'skip', 'error', 'like', 'unlike', 'dislike', 'und
 /* ---------- step 3: build ---------- */
 
 function runBuildFeed() {
+  if (runsInGithub_('The feed build')) return;
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) return tell_('FocusFeed', 'Another FocusFeed job is running. Try again in a few minutes.');
   let run;

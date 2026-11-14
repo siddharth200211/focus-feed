@@ -68,3 +68,31 @@ def test_bad_settings_stop_before_any_work(env):
     with pytest.raises(SystemExit, match="MIN_SCORE must be a whole number"):
         cli.main(["score"])
     assert gem.calls == []
+
+
+@pytest.mark.parametrize("command", ["collect", "score", "build", "adopt"])
+def test_phase_1_dataset_is_off_limits_until_pipeline_is_github(env, monkeypatch, command):
+    store, gem, settings = env
+    monkeypatch.setenv("BQ_DATASET", "focus_feed")  # the Apps Script's dataset
+    with pytest.raises(SystemExit, match="Set PIPELINE to github and run FocusFeed → Setup first"):
+        cli.main([command])
+    assert gem.calls == [] and store.rows == {}
+
+
+def test_after_the_switch_the_pipeline_runs_in_phase_1s_dataset(env, monkeypatch, capsys):
+    store, gem, settings = env
+    monkeypatch.setenv("BQ_DATASET", "focus_feed")
+    settings["PIPELINE"] = "github"
+    assert cli.main(["score"]) == 0
+    assert len(store.rows["scored_videos"]) == 30
+
+
+def test_adopt_copies_from_the_side_by_side_dataset_by_default(env, capsys):
+    store, _, settings = env
+    store.adopted = []
+    store.adopt_from = lambda source: store.adopted.append(source) or [f"raw_videos: 5 Phase 2 rows copied from {source}"]
+    settings["PIPELINE"] = "github"
+    cli.main(["adopt"])
+    assert store.adopted == ["focus_feed_v2_v2"], "<BQ_DATASET>_v2 (BQ_DATASET is focus_feed_v2 in this fixture)"
+    cli.main(["adopt", "--from", "focus_feed_v2"])
+    assert store.adopted[-1] == "focus_feed_v2"

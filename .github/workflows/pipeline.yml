@@ -11,6 +11,7 @@
 #      seed    copy Phase 1's raw_videos, scored_videos and events into an empty BQ_DATASET
 #      daily / collect / score / build
 #      compare  Phase 1's feed against Phase 2's, before switching over
+#      adopt    at the switch-over: copy Phase 2's own rows from <BQ_DATASET>_v2 (docs/phase2-setup.md, step 9)
 #
 # Google sign-in is keyless (Workload Identity Federation): see docs/phase2-setup.md for the
 # variables and secrets. Without WIF_PROVIDER the scheduled jobs skip themselves.
@@ -29,7 +30,7 @@ on:
       command:
         description: What to run
         type: choice
-        options: [check, setup, seed, daily, collect, score, build, compare]
+        options: [check, setup, seed, daily, collect, score, build, compare, adopt]
         default: check
 
 permissions:
@@ -103,7 +104,7 @@ jobs:
         run: pip install -e "pipeline[dbt]"
 
       - name: focusfeed ${{ env.COMMAND }}
-        if: steps.cfg.outputs.ready == 'true' && contains(fromJSON('["check", "setup", "seed", "compare"]'), env.COMMAND)
+        if: steps.cfg.outputs.ready == 'true' && contains(fromJSON('["check", "setup", "seed", "compare", "adopt"]'), env.COMMAND)
         run: python -m focusfeed "$COMMAND"
 
       - name: Collect

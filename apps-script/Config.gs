@@ -50,6 +50,8 @@ const SETTINGS = [
     note: 'bigquery storage only: where the dataset is created (e.g. US, EU, asia-south1). Cannot be changed once the dataset exists.' },
   { key: 'BQ_SANDBOX_EXPIRY', def: '', type: 'string', readOnly: true,
     note: 'Filled in by Setup, do not edit. BigQuery sandbox tables are deleted 60 days after creation: enable billing and remove the expirations before this date. You get a reminder email 15 days before.' },
+  { key: 'PIPELINE', def: 'apps_script', type: 'enum', options: ['apps_script', 'github'],
+    note: 'Who runs collect, score and the feed build. apps_script = this script, daily. github = the Phase 2 pipeline in GitHub Actions (Python + dbt, see docs/phase2-setup.md); Setup then turns off this script\'s collect and score. The web app and the nightly events load stay here either way. Run Setup after changing.' },
 ];
 
 const BQ_PROJECT_PATTERN = /^([a-z0-9.-]+:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$/;

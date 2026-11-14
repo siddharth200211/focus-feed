@@ -33,6 +33,7 @@ SETTINGS: list[tuple[str, object, str, dict]] = [
     ("BQ_DATASET", "focus_feed", "string", {"pattern": r"^[A-Za-z0-9_]{1,1024}$"}),
     ("BQ_LOCATION", "US", "string", {}),
     ("BQ_SANDBOX_EXPIRY", "", "string", {"readOnly": True}),
+    ("PIPELINE", "apps_script", "enum", {"options": ["apps_script", "github"]}),
 ]
 
 

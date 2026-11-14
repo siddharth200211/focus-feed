@@ -125,4 +125,26 @@ After a few daily runs, **Run workflow → compare** prints how far Phase 1's fe
 `focus_feed`) and Phase 2's (dbt, in `focus_feed_v2`) agree, and how often the two phases gave the
 same video the same score. They won't match exactly: each phase asks Gemini separately about new
 videos, so a 6 in one and a 7 in the other moves a video across MIN_SCORE. When they agree well,
-the web app switches to Phase 2 (steps to follow).
+switch over.
+
+## 9. Switch over
+
+Phase 2 takes over collecting, scoring and building the feed, in your original `focus_feed`
+dataset, so the web app (which reads `focus_feed.feed`) needs no change. The web app, the Settings
+tab and the nightly events load stay in Apps Script. About 5 minutes:
+
+1. **Sheet:** in the Settings tab set **PIPELINE** to `github`, then run **FocusFeed → Setup**. It
+   turns off the Apps Script's daily collect and score, and says so. (Until PIPELINE is `github`,
+   the Python jobs refuse to write into `focus_feed`, so the two phases can never both run there.)
+2. **GitHub:** Settings → Secrets and variables → Actions → Variables → **BQ_DATASET** → `focus_feed`.
+3. **Actions → Pipeline → Run workflow → adopt.** Copies the rows Phase 2 collected and scored on
+   its own while it ran beside Phase 1, from `focus_feed_v2` into `focus_feed`. Safe to repeat.
+4. **Run workflow → build.** dbt builds `focus_feed.feed` (plus `dim_videos`, `fct_events` and
+   `pipeline_daily`, and a `focus_feed_staging` dataset for its views). Open the web app: same app,
+   same feed, now built by Phase 2.
+
+From then on the daily run at 14:45 IST writes to `focus_feed`. After a week or so you can delete
+the `focus_feed_v2` and `focus_feed_v2_staging` datasets in the BigQuery console.
+
+**To undo:** set PIPELINE back to `apps_script` and run Setup (the daily triggers come back), and
+set BQ_DATASET back to `focus_feed_v2`.
