@@ -1,6 +1,6 @@
 # FocusFeed
 
-A swipe feed of YouTube Shorts about **one topic you choose**, so scrolling becomes study time. Mine is TOEFL. Yours can be anything.
+A swipe feed of YouTube Shorts about **one topic you choose**, so scrolling becomes study time. The demo runs on TOEFL prep; set any topic you like.
 
 Under the hood it's a small data pipeline, built twice. A daily job collects Shorts from the YouTube Data API, Gemini scores each one for relevance, and the results flow through `raw → scored → feed` tables in BigQuery. A mobile web app serves the feed and logs what you watch, like or skip, and that feeds back into the scoring. It runs on free tiers, and anyone can run their own copy.
 
