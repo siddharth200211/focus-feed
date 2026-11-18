@@ -7,7 +7,7 @@ Under the hood it's a small data pipeline, built twice. A daily job collects Sho
 - **Phase 1** runs the whole pipeline in Google Apps Script, so it needs nothing but a Google account (with Google Sheets or BigQuery as storage).
 - **Phase 2** moves collect, score and the feed build to **Python + dbt on GitHub Actions**, against the same tables, settings and web app.
 
-> **Status (November 2026):** Phase 1 is complete and in daily use. Phase 2 is live and runs every day beside it in its own dataset; the switch-over follows once the two feeds have been compared for a few days. On the first day, the dbt feed contained all 722 videos of the Apps Script feed with identical scores.
+> **Status (November 2026):** Phase 2 runs FocusFeed. It ran every day beside Phase 1 in its own dataset for four days, the two feeds were compared, and on 18 November it took over the main dataset. Apps Script still serves the web app, holds the Settings tab and loads events every night. See [Validating the migration](#validating-the-migration) for how the switch was checked.
 
 ## Phase 2 architecture
 
@@ -29,7 +29,7 @@ flowchart LR
   ET -. likes and dislikes .-> S
 ```
 
-Rounded boxes run every day at 14:45 IST in GitHub Actions (Python, then dbt). Cylinders are BigQuery tables. The web app and the events tab stay in Apps Script and Google Sheets, and the Settings tab drives both phases.
+Rounded boxes run every day at 14:45 IST in GitHub Actions (Python, then dbt); GitHub can start scheduled runs a few hours late, which a daily batch tolerates. Cylinders are BigQuery tables. The web app and the events tab stay in Apps Script and Google Sheets, and the Settings tab drives both phases.
 
 What makes it more than a script:
 
@@ -39,6 +39,21 @@ What makes it more than a script:
 - **Resilient scoring.** Gemini calls fall back across models, step down the "thinking" settings a model rejects, honour `retryDelay` on rate limits, and wait out overloads instead of failing.
 - **Keyless and least-privilege.** GitHub Actions signs in to Google Cloud through Workload Identity Federation; the service account can only run BigQuery jobs and edit BigQuery data. No key files anywhere; API keys live in GitHub secrets.
 - **Cost guards.** Any single dbt query that would scan over 1 GB is refused, the project has a 30 GB/day query quota and a budget alert, and the Gemini key sits in a project without billing. Typical cost: ₹0.
+
+## Validating the migration
+
+Phase 2 ran beside Phase 1 for four days, writing to its own dataset (`focus_feed_v2`), which started as a copy of Phase 1's history. Then `python -m focusfeed compare` checked the two against each other:
+
+| Check | Result |
+|---|---|
+| Same scores in, same feed out (day one) | All 722 videos of the Apps Script feed were in the dbt feed, with identical scores |
+| Feed overlap after four days | 847 videos in both feeds: 92% of the larger one (906 vs 923) |
+| Same score where a video is in both feeds | 93% |
+| Videos each phase scored separately with Gemini | 218: 42% got the same score, 82% were within one point, 28 landed on opposite sides of `MIN_SCORE` |
+
+The pipeline logic agrees; the remaining differences come from the inputs. Gemini scores the same video a little differently when it arrives in a different batch or with different taste examples, and each phase searched YouTube at a different time of day. That measurement is also why every video is scored once per prompt version and keeps its score: the feed doesn't shift from one day to the next.
+
+The switch-over on 18 November 2026: `PIPELINE` set to `github` (which turned off the Apps Script's own collect and score), `BQ_DATASET` pointed at `focus_feed`, `adopt` copied the rows Phase 2 had collected and scored on its own, and dbt rebuilt the feed there. The web app needed no change, because it reads `focus_feed.feed` by name.
 
 ## How it works (both phases)
 
@@ -141,7 +156,7 @@ Everything is configured in the **Settings** tab. Setup adds any new settings wi
 | YouTube Data API | 10,000 units a day | 50 searches × 100 units, plus about 1 unit per 50 video lookups. Roughly 5,100 a day |
 | Gemini API | Free tier on a no-billing project | About 2,500 videos a day ÷ 25 per call. Roughly 100 calls a day |
 | BigQuery | Sandbox, or the free tier after billing | A few MB a day |
-| Apps Script | Consumer account limits | One daily job and one nightly job |
+| Apps Script | Consumer account limits | The web app and the nightly events load (plus the daily jobs while `PIPELINE` is `apps_script`) |
 | GitHub Actions | Free for public repositories | Phase 2: one daily run of a few minutes, plus tests on each push |
 | BigQuery with billing (Phase 2) | 10 GB storage and 1 TB queries a month | About 60 MB of queries a day, capped by a 1 GB per-query limit and a 30 GB/day project quota |
 
@@ -195,8 +210,9 @@ Schema changes are **additive only**: add columns at the end; Setup (Phase 1) an
 ## Roadmap
 
 - **Phase 1 (done):** collect → score → feed in Apps Script, the swipe web app, learning from likes and skips, a nightly `events` load, Lite mode on Google Sheets.
-- **Phase 2 (live, November 2026):** Python + dbt on GitHub Actions for steps 1–3, running beside Phase 1 until the switch-over.
-- **Next:** a Looker Studio dashboard on `pipeline_daily` and the feed; for broad topics, a few Gemini-written multiple-choice questions that narrow the topic down before the first collect.
+- **Phase 2 (done, November 2026):** Python + dbt on GitHub Actions for steps 1–3. Ran beside Phase 1 for four days, then took over on 18 November ([how it was checked](#validating-the-migration)).
+- **Monitoring (done):** a Data Studio dashboard on `pipeline_daily` and the feed: runs, failures and rows written per day, and the feed with Gemini's reasons.
+- **Next:** for broad topics, a few Gemini-written multiple-choice questions that narrow the topic down before the first collect.
 
 ## License
 
