@@ -212,6 +212,7 @@ Schema changes are **additive only**: add columns at the end; Setup (Phase 1) an
 - **Phase 1 (done):** collect → score → feed in Apps Script, the swipe web app, learning from likes and skips, a nightly `events` load, Lite mode on Google Sheets.
 - **Phase 2 (done, November 2026):** Python + dbt on GitHub Actions for steps 1–3. Ran beside Phase 1 for four days, then took over on 18 November ([how it was checked](#validating-the-migration)).
 - **Monitoring (done):** a Data Studio dashboard on `pipeline_daily` and the feed: runs, failures and rows written per day, and the feed with Gemini's reasons.
+- **Phase 3 (planned):** change topics from the app instead of the sheet: saved topics, a PIN-protected settings screen, Gemini-suggested search phrases and rules, and a pipeline run started from the phone ([plan](docs/phase3-plan.md)).
 - **Next:** for broad topics, a few Gemini-written multiple-choice questions that narrow the topic down before the first collect.
 
 ## License
